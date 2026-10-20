@@ -1,4 +1,4 @@
-import { getPublicConfig } from "@/lib/env";
+import { getApiBaseUrl } from "@/lib/env";
 import { createClient } from "@/lib/supabase/browser";
 import type { ApiErrorPayload } from "@/types/domain";
 
@@ -13,7 +13,7 @@ export async function apiRequest<T>(path: string, init?: RequestInit): Promise<T
   const { data } = await createClient().auth.getSession();
   if (!data.session?.access_token) throw new DashboardApiError("Your session has expired.", 401);
 
-  const response = await fetch(`${getPublicConfig().apiBaseUrl}${path}`, {
+  const response = await fetch(`${getApiBaseUrl()}${path}`, {
     ...init,
     headers: {
       Authorization: `Bearer ${data.session.access_token}`,
