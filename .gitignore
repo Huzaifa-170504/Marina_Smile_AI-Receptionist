@@ -228,6 +228,8 @@ knowledge/**/*.pdf
 .catalog-*.sql
 
 # Dashboard dependencies, builds, local credentials, and test output
+!dashboard/src/lib/
+!dashboard/src/lib/**
 dashboard/node_modules/
 dashboard/.next/
 dashboard/out/
