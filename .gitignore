@@ -218,3 +218,22 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Marina Smile local configuration and generated artifacts
+.env.*
+!.env.example
+credentials/
+knowledge/**/*.pdf
+.test-tmp*/
+.catalog-*.sql
+
+# Dashboard dependencies, builds, local credentials, and test output
+dashboard/node_modules/
+dashboard/.next/
+dashboard/out/
+dashboard/coverage/
+dashboard/.env.local
+dashboard/.env.*.local
+!dashboard/.env.example
+dashboard/.vercel/
+supabase/.temp/
