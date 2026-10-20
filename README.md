@@ -13,12 +13,15 @@ Google Calendar decide what is true and what actions are allowed.
 
 | Resource | Link | Status |
 | --- | --- | --- |
-| Recruiter demo | Added after the public Vercel deployment URL is verified | Pending verification |
+| Recruiter UI | [Live Vercel site](https://marinasmileai-receptionist.vercel.app) | Verified HTTP 200 on 2026-10-20 |
+| Live demo queries | Same site, recruiter demo panel | Pending Render backend connection |
 | Vercel project | [Deployment project](https://vercel.com/neural-nexus-59b4/marina_smile_ai-receptionist) | Project supplied by owner |
 | Source | [GitHub repository](https://github.com/Huzaifa-170504/Marina_Smile_AI-Receptionist) | Public |
 
 The Vercel management URL requires project access and is not presented as the
-public demo URL. This README will only label a URL as live after it responds.
+public demo URL. The recruiter homepage and staff login route respond in
+production; the demo query endpoint intentionally returns `503` until the
+separately hosted FastAPI service and server-only secrets are connected.
 
 ## What the recruiter UI demonstrates
 
