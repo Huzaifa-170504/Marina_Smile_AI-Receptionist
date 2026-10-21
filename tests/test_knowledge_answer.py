@@ -4,6 +4,7 @@ from app.ai import knowledge_answer
 from app.ai.gemini_client import GroundedGeneration
 from app.ai.prompts import SAFE_FALLBACK
 from app.rag.retriever import KnowledgeResult
+from app.services.clinic_directory import DirectoryAnswer
 
 
 CLINIC_ID = "10000000-0000-4000-8000-000000000001"
@@ -51,6 +52,11 @@ def test_supported_answer_uses_retrieved_context(
     generated_text: str,
 ) -> None:
     captured: dict[str, str] = {}
+    monkeypatch.setattr(
+        knowledge_answer,
+        "answer_clinic_directory_question",
+        lambda _clinic_id, _question: None,
+    )
     monkeypatch.setattr(
         knowledge_answer,
         "search_knowledge",
@@ -102,6 +108,37 @@ def test_no_results_returns_safe_fallback(monkeypatch: pytest.MonkeyPatch) -> No
 
     assert answer.text == SAFE_FALLBACK
     assert answer.sources == []
+    assert answer.status == "needs_staff_confirmation"
+    assert answer.grounding == "safety"
+
+
+def test_directory_answer_bypasses_rag_and_preserves_grounding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        knowledge_answer,
+        "answer_clinic_directory_question",
+        lambda _clinic_id, _question: DirectoryAnswer(
+            text="The clinic lists eight active services.",
+            status="answered",
+            grounding="supabase",
+        ),
+    )
+    monkeypatch.setattr(
+        knowledge_answer,
+        "search_knowledge",
+        lambda *_args: pytest.fail("Directory answers must bypass RAG"),
+    )
+
+    answer = knowledge_answer.answer_knowledge_question(
+        CLINIC_ID,
+        "What services do you offer?",
+    )
+
+    assert answer.text == "The clinic lists eight active services."
+    assert answer.sources == []
+    assert answer.status == "answered"
+    assert answer.grounding == "supabase"
 
 
 def test_unsupported_service_uses_grounded_fallback(

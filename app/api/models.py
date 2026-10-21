@@ -234,6 +234,13 @@ class DemoQueryResponse(BaseModel):
     mode: Literal["knowledge", "availability"]
     status: str
     answer: str
+    grounding: Literal[
+        "conversation",
+        "supabase",
+        "rag",
+        "safety",
+        "scheduling",
+    ]
     sources: list[DemoSourceResponse] = Field(default_factory=list)
     slots: list[DemoSlotResponse] = Field(default_factory=list)
     latency_ms: int = Field(ge=0)

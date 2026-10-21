@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from typing import Literal
 
 from app.ai.gemini_client import GeminiGenerationError, generate_grounded_answer
 from app.ai.prompts import (
@@ -11,6 +12,7 @@ from app.ai.prompts import (
     build_knowledge_prompt,
 )
 from app.rag.retriever import KnowledgeResult, search_knowledge
+from app.services.clinic_directory import answer_clinic_directory_question
 
 
 logger = logging.getLogger(__name__)
@@ -45,6 +47,12 @@ class KnowledgeSource:
 class KnowledgeAnswer:
     text: str
     sources: list[KnowledgeSource]
+    status: Literal[
+        "answered",
+        "needs_clarification",
+        "needs_staff_confirmation",
+    ] = "answered"
+    grounding: Literal["conversation", "supabase", "rag", "safety"] = "rag"
 
 
 def _to_sources(results: list[KnowledgeResult]) -> list[KnowledgeSource]:
@@ -74,10 +82,24 @@ def answer_knowledge_question(clinic_id: str, question: str) -> KnowledgeAnswer:
         raise ValueError("question must not be empty")
 
     normalized_question = question.strip()
+    directory_answer = answer_clinic_directory_question(clinic_id, normalized_question)
+    if directory_answer is not None:
+        return KnowledgeAnswer(
+            text=directory_answer.text,
+            sources=[],
+            status=directory_answer.status,
+            grounding=directory_answer.grounding,
+        )
+
     results = search_knowledge(clinic_id, normalized_question)
     sources = _to_sources(results)
     if not results or _requires_safe_fallback(normalized_question):
-        return KnowledgeAnswer(text=SAFE_FALLBACK, sources=sources)
+        return KnowledgeAnswer(
+            text=SAFE_FALLBACK,
+            sources=sources,
+            status="needs_staff_confirmation",
+            grounding="safety",
+        )
 
     user_prompt = build_knowledge_prompt(normalized_question, results)
     try:
@@ -87,8 +109,18 @@ def answer_knowledge_question(clinic_id: str, question: str) -> KnowledgeAnswer:
         )
     except GeminiGenerationError:
         logger.exception("Grounded Gemini answer generation failed")
-        return KnowledgeAnswer(text=SAFE_FALLBACK, sources=sources)
+        return KnowledgeAnswer(
+            text=SAFE_FALLBACK,
+            sources=sources,
+            status="needs_staff_confirmation",
+            grounding="safety",
+        )
 
     if not generated.supported:
-        return KnowledgeAnswer(text=SAFE_FALLBACK, sources=sources)
+        return KnowledgeAnswer(
+            text=SAFE_FALLBACK,
+            sources=sources,
+            status="needs_staff_confirmation",
+            grounding="safety",
+        )
     return KnowledgeAnswer(text=generated.text, sources=sources)

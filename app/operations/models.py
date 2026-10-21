@@ -71,6 +71,7 @@ class Dentist(BaseModel):
     id: str
     clinic_id: str
     name: str
+    specialty: str | None = None
 
 
 class Service(BaseModel):

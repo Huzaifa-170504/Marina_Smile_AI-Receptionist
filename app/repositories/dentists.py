@@ -26,7 +26,7 @@ def list_active_dentists(
     response = (
         (client or get_supabase_client())
         .table("dentists")
-        .select("id,clinic_id,name")
+        .select("id,clinic_id,name,specialty")
         .eq("clinic_id", normalized_clinic_id)
         .eq("active", True)
         .execute()
@@ -48,6 +48,40 @@ def match_dentists(dentists: list[Dentist], name_text: str) -> list[Dentist]:
         name_parts = _normalize_name(dentist.name).split()
         if requested in name_parts:
             matches.append(dentist)
+    return matches
+
+
+def find_dentists_in_text(dentists: list[Dentist], text: str) -> list[Dentist]:
+    """Find known dentists mentioned in free text without fuzzy guessing."""
+    normalized_text = _normalize_name(text)
+    if not normalized_text:
+        return []
+
+    padded_text = f" {normalized_text} "
+    full_name_matches = [
+        dentist
+        for dentist in dentists
+        if f" {_normalize_name(dentist.name)} " in padded_text
+    ]
+    if full_name_matches:
+        return full_name_matches
+
+    raw_text = unicodedata.normalize("NFKC", text).casefold()
+    if not re.search(r"\b(?:dr\.?|doctor|dentist)\b", raw_text):
+        return []
+
+    token_matches: dict[str, list[Dentist]] = {}
+    for dentist in dentists:
+        for token in _normalize_name(dentist.name).split():
+            if len(token) >= 3:
+                token_matches.setdefault(token, []).append(dentist)
+
+    matches: list[Dentist] = []
+    normalized_tokens = set(normalized_text.split())
+    for token in normalized_tokens:
+        candidates = token_matches.get(token, [])
+        if len(candidates) == 1 and candidates[0] not in matches:
+            matches.append(candidates[0])
     return matches
 
 

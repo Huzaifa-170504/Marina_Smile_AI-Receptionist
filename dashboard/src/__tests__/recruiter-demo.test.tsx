@@ -31,6 +31,7 @@ describe("RecruiterDemo", () => {
         mode: "knowledge",
         status: "answered",
         answer: "Whitening starts from the stored clinic price.",
+        grounding: "rag",
         latency_ms: 421,
         sources: [{ filename: "clinic.pdf", page_number: 2, similarity: 0.91 }],
         slots: [],
@@ -40,8 +41,10 @@ describe("RecruiterDemo", () => {
     expect(await screen.findByText("Live services connected")).toBeInTheDocument();
     expect(screen.getByText("8")).toBeInTheDocument();
 
+    await userEvent.click(screen.getByRole("button", { name: "How much is teeth whitening?" }));
     await userEvent.click(screen.getByRole("button", { name: "Run live query" }));
     expect(await screen.findByText("Whitening starts from the stored clinic price.")).toBeInTheDocument();
+    expect(screen.getByText("Verified from: PDF knowledge base via pgvector")).toBeInTheDocument();
     expect(screen.getByText(/clinic\.pdf · page 2 · 91% match/)).toBeInTheDocument();
   });
 
@@ -53,5 +56,16 @@ describe("RecruiterDemo", () => {
     expect(screen.getByLabelText("Ask the running system")).toHaveValue(
       "Find the next available teeth cleaning appointment",
     );
+  });
+
+  it("offers recruiter-friendly questions from different data paths", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(jsonResponse({}, false));
+    render(<RecruiterDemo />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Which doctors are available?" }));
+    expect(screen.getByLabelText("Ask the running system")).toHaveValue(
+      "Which doctors are available?",
+    );
+    expect(screen.getByRole("button", { name: "Which services are offered by Dr. Sara Haddad?" })).toBeInTheDocument();
   });
 });

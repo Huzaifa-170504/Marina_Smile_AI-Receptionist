@@ -5,6 +5,7 @@ import { CalendarClock, Database, FileSearch, LoaderCircle, Send, ShieldCheck } 
 
 
 type DemoMode = "knowledge" | "availability";
+type DemoGrounding = "conversation" | "supabase" | "rag" | "safety" | "scheduling";
 
 type DemoStatus = {
   api: "online";
@@ -19,6 +20,7 @@ type DemoResult = {
   mode: DemoMode;
   status: string;
   answer: string;
+  grounding: DemoGrounding;
   latency_ms: number;
   sources: Array<{ filename: string; page_number: number | null; similarity: number }>;
   slots: Array<{
@@ -32,8 +34,30 @@ type DemoResult = {
 };
 
 const EXAMPLES: Record<DemoMode, string> = {
-  knowledge: "How much is teeth whitening?",
+  knowledge: "What services do you offer?",
   availability: "Find the next available teeth cleaning appointment",
+};
+
+const EXAMPLE_QUERIES: Record<DemoMode, string[]> = {
+  knowledge: [
+    "Hello",
+    "What services do you offer?",
+    "Which doctors are available?",
+    "Which services are offered by Dr. Sara Haddad?",
+    "How much is teeth whitening?",
+  ],
+  availability: [
+    "Find the next available teeth cleaning appointment",
+    "Is Dr. Omar available next week for Invisalign?",
+  ],
+};
+
+const GROUNDING_LABELS: Record<DemoGrounding, string> = {
+  conversation: "Conversation capability guide",
+  supabase: "Live Supabase clinic directory",
+  rag: "PDF knowledge base via pgvector",
+  safety: "Deterministic safety policy",
+  scheduling: "Schedules, appointments, and Calendar",
 };
 
 async function readError(response: Response): Promise<string> {
@@ -116,7 +140,7 @@ export function RecruiterDemo() {
       </div>
 
       <div className="demo-tabs" role="tablist" aria-label="Demo query type">
-        <button type="button" role="tab" aria-selected={mode === "knowledge"} onClick={() => chooseMode("knowledge")}>Knowledge RAG</button>
+        <button type="button" role="tab" aria-selected={mode === "knowledge"} onClick={() => chooseMode("knowledge")}>Knowledge + live data</button>
         <button type="button" role="tab" aria-selected={mode === "availability"} onClick={() => chooseMode("availability")}>Live availability</button>
       </div>
 
@@ -135,6 +159,22 @@ export function RecruiterDemo() {
             {loading ? <LoaderCircle className="spin" size={19} /> : <Send size={19} />}
           </button>
         </div>
+        <div className="demo-examples" aria-label="Example demo questions">
+          <span>Try:</span>
+          {EXAMPLE_QUERIES[mode].map((example) => (
+            <button
+              type="button"
+              key={example}
+              onClick={() => {
+                setQuery(example);
+                setResult(null);
+                setError(null);
+              }}
+            >
+              {example}
+            </button>
+          ))}
+        </div>
         <p>Queries are validated, clinic-scoped, rate-limited, and cannot create or change appointments.</p>
       </form>
 
@@ -145,6 +185,7 @@ export function RecruiterDemo() {
           <div className="demo-result">
             <div className="result-meta"><span>{result.status.replaceAll("_", " ")}</span><span>{result.latency_ms} ms</span></div>
             <p>{result.answer}</p>
+            <div className="result-grounding">Verified from: {GROUNDING_LABELS[result.grounding]}</div>
             {result.sources.length ? (
               <ul className="source-list" aria-label="Retrieved sources">
                 {result.sources.map((source, index) => (

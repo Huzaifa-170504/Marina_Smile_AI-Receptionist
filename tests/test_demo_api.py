@@ -47,10 +47,42 @@ def test_demo_knowledge_query_returns_grounded_sources(monkeypatch: Any) -> None
     assert response.status_code == 200
     payload = response.json()
     assert payload["mode"] == "knowledge"
+    assert payload["status"] == "answered"
+    assert payload["grounding"] == "rag"
     assert payload["sources"] == [
         {"filename": "clinic.pdf", "page_number": 2, "similarity": 0.91}
     ]
     assert quota_calls == [(FINGERPRINT, "knowledge")]
+
+
+def test_demo_directory_answer_is_answered_without_pdf_sources(monkeypatch: Any) -> None:
+    app.dependency_overrides[require_demo_access] = lambda: None
+    monkeypatch.setattr(
+        "app.api.routes.demo.consume_demo_quota",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "app.api.routes.demo.answer_knowledge_question",
+        lambda _clinic_id, _query: KnowledgeAnswer(
+            text="The clinic lists eight active services.",
+            sources=[],
+            status="answered",
+            grounding="supabase",
+        ),
+    )
+    try:
+        response = TestClient(app).post(
+            "/api/demo/query",
+            headers={"X-Demo-Visitor": FINGERPRINT},
+            json={"mode": "knowledge", "query": "What services do you offer?"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "answered"
+    assert response.json()["grounding"] == "supabase"
+    assert response.json()["sources"] == []
 
 
 def test_demo_query_rejects_unbounded_or_unknown_input() -> None:

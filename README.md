@@ -13,21 +13,22 @@ Google Calendar decide what is true and what actions are allowed.
 
 | Resource | Link | Status |
 | --- | --- | --- |
-| Recruiter UI | [Live Vercel site](https://marinasmileai-receptionist.vercel.app) | Verified HTTP 200 on 2026-10-20 |
-| Live demo queries | Same site, recruiter demo panel | Pending Render backend connection |
+| Recruiter UI | [Live Vercel site](https://marinasmileai-receptionist.vercel.app) | Verified HTTP 200 on 2026-10-21 |
+| Live demo queries | Same site, recruiter demo panel | Vercel proxy and Render backend connected |
 | Vercel project | [Deployment project](https://vercel.com/neural-nexus-59b4/marina_smile_ai-receptionist) | Project supplied by owner |
 | Source | [GitHub repository](https://github.com/Huzaifa-170504/Marina_Smile_AI-Receptionist) | Public |
 
 The Vercel management URL requires project access and is not presented as the
-public demo URL. The recruiter homepage and staff login route respond in
-production; the demo query endpoint intentionally returns `503` until the
-separately hosted FastAPI service and server-only secrets are connected.
+public demo URL. The recruiter homepage, staff login, aggregate status, and
+read-only demo queries respond through the production deployment.
 
 ## What the recruiter UI demonstrates
 
 - A public project narrative and architecture overview at `/`
 - Live aggregate health data without exposing patient records
 - Grounded clinic questions using Supabase pgvector retrieval and Gemini
+- Live service, doctor, specialty, and doctor-service directory answers from
+  Supabase without asking the model to invent operational facts
 - Read-only availability checks against schedules, appointment conflicts, and
   Google Calendar
 - Source provenance, normalized errors, and measured request latency
@@ -38,6 +39,19 @@ Supabase credentials, the Gemini key, Google credentials, and the internal demo
 token are never sent to the browser. Queries are validated, clinic-scoped, and
 rate-limited through PostgreSQL. The demo cannot book, reschedule, cancel, or
 read patient records.
+
+Suggested recruiter checks:
+
+- `Hello` demonstrates concise conversational guidance.
+- `What services do you offer?` reads the active service catalogue.
+- `Which doctors are available?` lists active doctors and clearly separates
+  active records from real appointment availability.
+- `Which services are offered by Dr. Sara Haddad?` verifies the live
+  many-to-many doctor-service relationship.
+- `How much is teeth whitening?` demonstrates PDF retrieval, pgvector source
+  scoring, and grounded Gemini generation.
+- The Live availability tab demonstrates read-only schedule and Calendar
+  conflict checks.
 
 ## Architecture
 
@@ -169,6 +183,7 @@ Open `http://localhost:3000` for the recruiter experience or
 | `GEMINI_EMBEDDING_MODEL` | Must remain `gemini-embedding-2` |
 | `GEMINI_EMBEDDING_DIMENSIONS` | Must remain `768` |
 | `DEFAULT_CLINIC_ID` | Fixed clinic scope for scripts and public demo |
+| `RAG_MATCH_THRESHOLD` | Minimum pgvector similarity accepted for knowledge context |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Ignored service-account JSON path |
 | `DASHBOARD_ALLOWED_ORIGINS` | Comma-separated trusted frontend origins |
 | `DASHBOARD_APPLICATION_URL` | Origin used for Auth email redirects |

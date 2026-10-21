@@ -95,8 +95,9 @@ async def demo_query(
             )
             return DemoQueryResponse(
                 mode="knowledge",
-                status="answered" if result.sources else "needs_staff_confirmation",
+                status=result.status,
                 answer=result.text,
+                grounding=result.grounding,
                 sources=[
                     DemoSourceResponse(
                         filename=source.filename,
@@ -122,6 +123,7 @@ async def demo_query(
                 if result.slots
                 else "No verified slots matched that request."
             ),
+            grounding="scheduling",
             slots=[
                 DemoSlotResponse(
                     dentist_name=slot.dentist_name,
