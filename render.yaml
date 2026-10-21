@@ -22,6 +22,6 @@ services:
       - key: DASHBOARD_APPLICATION_URL
         sync: false
       - key: DEMO_ENABLED
-        value: "false"
+        value: "true"
       - key: DEMO_API_TOKEN
         sync: false
