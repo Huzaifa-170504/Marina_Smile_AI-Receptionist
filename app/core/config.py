@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     )
     rag_match_count: int = Field(default=5, ge=1, alias="RAG_MATCH_COUNT")
     rag_match_threshold: float = Field(
-        default=0.70,
+        default=0.60,
         ge=0.0,
         le=1.0,
         alias="RAG_MATCH_THRESHOLD",

@@ -20,6 +20,7 @@ def test_settings_load_required_values(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert settings.gemini_embedding_model == "gemini-embedding-2"
     assert settings.gemini_embedding_dimensions == 768
+    assert settings.rag_match_threshold == 0.60
     assert settings.dashboard_origins == []
 
 

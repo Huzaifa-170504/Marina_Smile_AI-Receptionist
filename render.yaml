@@ -25,3 +25,5 @@ services:
         value: "true"
       - key: DEMO_API_TOKEN
         sync: false
+      - key: RAG_MATCH_THRESHOLD
+        value: "0.60"
