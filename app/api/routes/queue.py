@@ -27,6 +27,5 @@ async def transition_queue(
             "p_visit_id": str(visit_id),
             "p_expected_status": transition.expected_status,
             "p_target_status": transition.target_status,
-            "p_staff_user_id": str(staff.id),
         },
     )

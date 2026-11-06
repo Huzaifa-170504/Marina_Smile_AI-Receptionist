@@ -25,6 +25,23 @@ shutdown. No separate Render worker is needed.
 4. In a private Telegram chat, send `/start`. The bot and API stop when you
    stop the local process.
 
+## Patient booking and email lookup
+
+Booking lookup accepts the patient's registered phone number or email and
+requires their full name to match one active patient record. Telegram's
+"Share registered phone" button remains available. Email lookup requires
+applying `supabase/migrations/20261106104639_add_patient_email_for_telegram.sql`
+to the project's database and adding the patient's email to their contact
+record. This migration is additive; it is not applied automatically by the bot.
+
+The bot checks active services, assigned doctors, and live slots. Receipt-
+requiring requests remain pending until clinic staff verifies the payment.
+On the patient's next **@ Booking status** check, the bot attempts to reserve
+the selected slot and create/confirm its Google Calendar event. Services that
+do not require payment are confirmed immediately through the same reservation
+path. Confirmation requires the existing backend Supabase service key and
+Google Calendar credentials to work.
+
 Do not also run `python -m app.telegram.bot` while the API is polling with the
 same token.
 
