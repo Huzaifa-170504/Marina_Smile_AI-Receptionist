@@ -52,6 +52,7 @@ def find_available_slots(
     *,
     exclude_appointment_id: str | None = None,
     exclude_calendar_event_id: str | None = None,
+    duration_override_minutes: int | None = None,
     client: Client | None = None,
     calendar_client: CalendarReader | None = None,
 ) -> AvailabilitySearchResult:
@@ -102,6 +103,11 @@ def find_available_slots(
             selected_service.id,
             client=supabase,
         )
+
+    if duration_override_minutes is not None:
+        if duration_override_minutes <= 0:
+            raise ValueError("duration_override_minutes must be positive")
+        duration_minutes = duration_override_minutes
 
     resolved_dentist = dentists[0].name if len(dentists) == 1 else None
     resolved_service = selected_service.name if selected_service else None
