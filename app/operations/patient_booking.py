@@ -125,7 +125,7 @@ def lookup_identities(
     contact_ids = [contact["id"] for contact in contacts]
     patients = (
         supabase.table("patients")
-        .select("id,full_name,primary_contact_id,active")
+        .select("id,full_name,primary_contact_id,active,age_at_registration,gender")
         .eq("clinic_id", clinic_id)
         .in_("primary_contact_id", contact_ids)
         .execute()
@@ -141,6 +141,8 @@ def resolve_or_register_patient(
     identifier: str,
     full_name: str,
     *,
+    age_at_registration: int | None = None,
+    gender: str | None = None,
     telegram_chat_id: int | None = None,
     client: Client | None = None,
 ) -> dict:
@@ -196,7 +198,7 @@ def resolve_or_register_patient(
 
     patients = (
         supabase.table("patients")
-        .select("id,full_name,primary_contact_id,active")
+        .select("id,full_name,primary_contact_id,active,age_at_registration,gender")
         .eq("clinic_id", clinic_id)
         .eq("primary_contact_id", contact["id"])
         .execute()
@@ -205,11 +207,23 @@ def resolve_or_register_patient(
     )
     for patient in patients:
         if normalize_name(patient["full_name"]) == normalize_name(name):
+            updates = {}
+            if age_at_registration is not None and patient.get("age_at_registration") is None:
+                updates["age_at_registration"] = age_at_registration
+            if gender is not None and not patient.get("gender"):
+                updates["gender"] = gender
+            if updates:
+                supabase.table("patients").update(updates).eq(
+                    "clinic_id", clinic_id
+                ).eq("id", patient["id"]).execute()
+                patient.update(updates)
             return {
                 "clinic_id": clinic_id,
                 "contact_id": contact["id"],
                 "patient_id": patient["id"],
                 "name": patient["full_name"],
+                "age_at_registration": patient.get("age_at_registration"),
+                "gender": patient.get("gender"),
                 "telegram_chat_id": contact.get("telegram_chat_id") or telegram_chat_id,
             }
 
@@ -226,7 +240,8 @@ def resolve_or_register_patient(
                 "clinic_id": clinic_id,
                 "primary_contact_id": contact["id"],
                 "full_name": name,
-                "gender": "other",
+                "gender": gender or "other",
+                "age_at_registration": age_at_registration,
                 "active": True,
             }
         )
@@ -242,6 +257,8 @@ def resolve_or_register_patient(
         "contact_id": contact["id"],
         "patient_id": patient["id"],
         "name": patient["full_name"],
+        "age_at_registration": patient.get("age_at_registration"),
+        "gender": patient.get("gender"),
         "telegram_chat_id": contact.get("telegram_chat_id") or telegram_chat_id,
     }
 
