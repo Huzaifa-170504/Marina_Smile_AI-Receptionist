@@ -26,13 +26,13 @@ from app.operations.patient_booking import (
     create_booking_request,
     describe_active_booking,
     finalize_booking_request,
-    normalize_phone,
+    lookup_identities,
+    normalize_name,
     resolve_or_register_patient,
 )
 from app.operations.slot_finder import find_available_slots
 from app.repositories.clinics import get_active_clinic
 from app.repositories.dentists import filter_dentists_for_service, list_active_dentists
-from app.repositories.services import list_active_services
 from app.telegram.notifications import run_notification_worker
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
@@ -45,13 +45,21 @@ MENU = (
     ("@ Book appointment", "@ See services"),
     ("@ See doctors", "@ Booking status"),
     ("@ Cancel booking", "@ Uploaded payments"),
-    ("@ Ask MarinaSmileAI", "@ Main menu"),
+    ("@ Ask MarinaSmileAI",),
+)
+IDENTIFIER_PROMPT = (
+    "Enter the phone number you used to book, in international format "
+    "(e.g. +92 311-8917906) or local format (e.g. 03118917906), or your email address."
 )
 
 
 def _menu():
     return ReplyKeyboardMarkup([[KeyboardButton(item) for item in row] for row in MENU],
                                resize_keyboard=True, is_persistent=True)
+
+
+def _main_menu_row():
+    return [InlineKeyboardButton("🏠 Main menu", callback_data="main-menu")]
 
 
 def _client():
@@ -125,72 +133,208 @@ async def _private(update: Update) -> bool:
     return False
 
 
-async def _require_patient(update, context):
-    patient = context.user_data.get("patient")
-    if patient:
-        return patient
-    await update.effective_message.reply_text(
-        "Enter the phone number or email registered with the clinic. You can also share your phone, then enter your full name.",
-        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("Share registered phone", request_contact=True)]],
-                                         resize_keyboard=True, one_time_keyboard=True))
-    context.user_data[STATE] = "identifier"
-    return None
-
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await _private(update):
-        context.user_data.pop(STATE, None)
+        _clear_flow(context)
         await update.effective_message.reply_text("Welcome to Marina Smile. Choose an option:",
                                                    reply_markup=_menu())
+
+
+def _clear_flow(context):
+    for key in (
+        STATE,
+        "booking",
+        "slots",
+        "patient",
+        "booking_identifier",
+        "booking_patients",
+        "lookup_target",
+        "request_id",
+        "cancel_status",
+        "cancel_appointments",
+    ):
+        context.user_data.pop(key, None)
 
 
 async def _contact(update, context):
     if not await _private(update):
         return
-    if context.user_data.get(STATE) != "identifier":
+    if context.user_data.get(STATE) != "booking_identifier":
         return
     contact = update.effective_message.contact
     if not contact or not update.effective_user or contact.user_id != update.effective_user.id or not contact.phone_number:
         await update.effective_message.reply_text("Please share your own phone using the button.")
         return
-    context.user_data["patient_identifier"] = ("phone", _phone_digits(contact.phone_number))
-    context.user_data[STATE] = "name"
-    await update.effective_message.reply_text("Enter your full name exactly as registered with the clinic.")
+    context.user_data["booking_identifier"] = ("phone", _phone_digits(contact.phone_number))
+    await _continue_booking_identifier(update, context)
 
 
-async def _verify_identifier(update, context):
-    identifier = _normalize_identifier(update.effective_message.text or "")
-    if identifier is None:
-        await update.effective_message.reply_text("Enter a valid registered phone number or email address.")
-        return
-    context.user_data["patient_identifier"] = identifier
-    context.user_data[STATE] = "name"
-    await update.effective_message.reply_text("Enter your full name exactly as registered with the clinic.")
-
-
-async def _verify_name(update, context):
+async def _continue_booking_identifier(update, context):
+    identifier_type, identifier = context.user_data["booking_identifier"]
     try:
-        identifier_type, identifier = context.user_data.pop("patient_identifier", ("", ""))
-        chat_id = update.effective_chat.id if update.effective_chat else None
-        patient = await asyncio.to_thread(
-            resolve_or_register_patient,
-            _clinic_id(),
-            identifier_type,
-            identifier,
-            update.effective_message.text.strip(),
-            telegram_chat_id=chat_id,
+        info = await asyncio.to_thread(
+            lookup_identities, _clinic_id(), identifier_type, identifier
         )
-    except PatientBookingError as exc:
-        context.user_data.pop(STATE, None)
-        await update.effective_message.reply_text(str(exc), reply_markup=_menu())
-        return
     except Exception:
         logger.exception("Telegram patient lookup failed")
         await update.effective_message.reply_text("I couldn't verify your record right now. Please try later.")
         return
-    context.user_data.pop(STATE, None)
+
+    patients = [row for row in info.get("patients", []) if row.get("active", True)]
+    if not info.get("contacts"):
+        context.user_data[STATE] = "booking_name"
+        await update.effective_message.reply_text(
+            "No previous record found. Enter your full name to register as a new patient."
+        )
+        return
+    if not patients:
+        context.user_data[STATE] = "booking_name"
+        await update.effective_message.reply_text(
+            "Enter your full name to complete your patient registration."
+        )
+        return
+    if len(patients) > 1:
+        context.user_data["booking_patients"] = patients
+        context.user_data[STATE] = "booking_name"
+        await update.effective_message.reply_text(
+            "More than one patient uses this phone/email. Enter the full name of the patient booking."
+        )
+        return
+
+    patient = {
+        "clinic_id": _clinic_id(),
+        "contact_id": patients[0]["primary_contact_id"],
+        "patient_id": patients[0]["id"],
+        "name": patients[0]["full_name"],
+    }
+    await _after_patient_verified(update, context, patient)
+
+
+async def _verify_booking_identifier(update, context):
+    identifier = _normalize_identifier(update.effective_message.text or "")
+    if identifier is None:
+        await update.effective_message.reply_text(IDENTIFIER_PROMPT)
+        return
+    context.user_data["booking_identifier"] = identifier
+    await _continue_booking_identifier(update, context)
+
+
+async def _verify_booking_name(update, context):
+    name = " ".join((update.effective_message.text or "").split())
+    if len(name) < 2:
+        await update.effective_message.reply_text("Enter your full name.")
+        return
+
+    patients = context.user_data.pop("booking_patients", None)
+    if patients:
+        matches = [row for row in patients if normalize_name(row["full_name"]) == normalize_name(name)]
+        if len(matches) != 1:
+            context.user_data["booking_patients"] = patients
+            await update.effective_message.reply_text(
+                "That name does not match a patient for this phone/email. Enter the full registered name."
+            )
+            return
+        patient = {
+            "clinic_id": _clinic_id(),
+            "contact_id": matches[0]["primary_contact_id"],
+            "patient_id": matches[0]["id"],
+            "name": matches[0]["full_name"],
+        }
+    else:
+        identifier = context.user_data.get("booking_identifier")
+        if not identifier:
+            _clear_flow(context)
+            await update.effective_message.reply_text("Please start again with @ Book appointment.", reply_markup=_menu())
+            return
+        try:
+            patient = await asyncio.to_thread(
+                resolve_or_register_patient,
+                _clinic_id(),
+                identifier[0],
+                identifier[1],
+                name,
+                telegram_chat_id=update.effective_chat.id if update.effective_chat else None,
+            )
+        except PatientBookingError as exc:
+            await update.effective_message.reply_text(str(exc), reply_markup=_menu())
+            return
+        except Exception:
+            logger.exception("Telegram patient registration failed")
+            await update.effective_message.reply_text("I couldn't save your patient record. Please try later.")
+            return
+    await _after_patient_verified(update, context, patient)
+
+
+async def _after_patient_verified(update, context, patient):
     context.user_data["patient"] = patient
-    await update.effective_message.reply_text(f"Patient record linked for {patient['name']}.", reply_markup=_menu())
+    try:
+        existing = await asyncio.to_thread(
+            active_booking_for_patient, patient["clinic_id"], patient["patient_id"]
+        )
+        if existing:
+            _clear_flow(context)
+            await update.effective_message.reply_text(describe_active_booking(existing), reply_markup=_menu())
+            return
+        services = await asyncio.to_thread(_load_service_rows, patient["clinic_id"])
+    except Exception:
+        logger.exception("Telegram booking services lookup failed")
+        await update.effective_message.reply_text("Booking is temporarily unavailable.")
+        return
+    if not services:
+        await update.effective_message.reply_text("No active services are available to book.", reply_markup=_menu())
+        return
+    context.user_data["booking"] = {"services": services, "selected": []}
+    context.user_data[STATE] = "booking"
+    await update.effective_message.reply_text(
+        "Choose one or more services. Your bill is calculated automatically:",
+        reply_markup=_service_keyboard(context.user_data["booking"]),
+    )
+
+
+async def _begin_lookup(update, context, target: str):
+    _clear_flow(context)
+    context.user_data["lookup_target"] = target
+    context.user_data[STATE] = "lookup_identifier"
+    await update.effective_message.reply_text(IDENTIFIER_PROMPT)
+
+
+async def _verify_lookup_identifier(update, context):
+    identifier = _normalize_identifier(update.effective_message.text or "")
+    if identifier is None:
+        await update.effective_message.reply_text(IDENTIFIER_PROMPT)
+        return
+    try:
+        info = await asyncio.to_thread(
+            lookup_identities, _clinic_id(), identifier[0], identifier[1]
+        )
+    except Exception:
+        logger.exception("Telegram identifier lookup failed")
+        await update.effective_message.reply_text("I couldn't look up that phone/email right now. Please try later.")
+        return
+    target = context.user_data.pop("lookup_target", None)
+    context.user_data.pop(STATE, None)
+    if not info.get("contacts"):
+        message = (
+            "You did not pay your bill yet."
+            if target == "payments"
+            else "No booking was found for that phone number or email."
+        )
+        await update.effective_message.reply_text(message, reply_markup=_menu())
+        return
+    patient_ids = [row["id"] for row in info.get("patients", [])]
+    contact_ids = [row["id"] for row in info.get("contacts", [])]
+    if target == "status":
+        await _status(update, patient_ids)
+    elif target == "cancel":
+        await _cancel_menu(update, patient_ids, contact_ids, context)
+    elif target == "payments":
+        await _payments(update, patient_ids)
+
+
+async def _begin_booking(update, context):
+    _clear_flow(context)
+    context.user_data[STATE] = "booking_identifier"
+    await update.effective_message.reply_text(IDENTIFIER_PROMPT)
 
 
 async def _services(update):
@@ -211,10 +355,9 @@ async def _services(update):
 async def _doctors(update):
     def load():
         client, clinic = _client(), _clinic_id()
-        dentists = client.table("dentists").select(
+        return client.table("dentists").select(
             "id,name,specialty,dentist_services(services(name))"
         ).eq("clinic_id", clinic).eq("active", True).order("name").execute().data or []
-        return dentists
 
     try:
         dentists = await asyncio.to_thread(load)
@@ -253,6 +396,7 @@ def _service_keyboard(booking: dict) -> InlineKeyboardMarkup:
         suffix = f" · {row.get('currency') or 'AED'} {price}" if price is not None else ""
         rows.append([InlineKeyboardButton(f"{mark} {row['name']}{suffix}", callback_data=f"toggle:{service_id}")])
     rows.append([InlineKeyboardButton("Continue with selected services", callback_data="services-done")])
+    rows.append(_main_menu_row())
     return InlineKeyboardMarkup(rows)
 
 
@@ -279,33 +423,6 @@ def _selected_summary(booking: dict) -> tuple[list[dict], float, int]:
     return rows, total, duration
 
 
-async def _begin_booking(update, context):
-    patient = await _require_patient(update, context)
-    if not patient:
-        return
-    try:
-        existing = await asyncio.to_thread(
-            active_booking_for_patient, patient["clinic_id"], patient["patient_id"]
-        )
-        if existing:
-            await update.effective_message.reply_text(describe_active_booking(existing), reply_markup=_menu())
-            return
-        services = await asyncio.to_thread(_load_service_rows, patient["clinic_id"])
-    except Exception:
-        logger.exception("Telegram booking services lookup failed")
-        await update.effective_message.reply_text("Booking is temporarily unavailable.")
-        return
-    if not services:
-        await update.effective_message.reply_text("No active services are available to book.")
-        return
-    context.user_data["booking"] = {"services": services, "selected": []}
-    context.user_data[STATE] = "booking"
-    await update.effective_message.reply_text(
-        "Choose one or more services. Your bill is calculated automatically:",
-        reply_markup=_service_keyboard(context.user_data["booking"]),
-    )
-
-
 def _eligible_dentists(patient: dict, service_ids: list[str]):
     dentists = list_active_dentists(patient["clinic_id"])
     eligible = dentists
@@ -324,6 +441,7 @@ def _doctor_keyboard(booking: dict) -> InlineKeyboardMarkup:
         for dentist_id, name in booking.get("dentists", {}).items()
     ]
     rows.append([InlineKeyboardButton("Change services", callback_data="back-services")])
+    rows.append(_main_menu_row())
     return InlineKeyboardMarkup(rows)
 
 
@@ -331,7 +449,7 @@ def _payment_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Cash in hand", callback_data="mode:cash")],
         [InlineKeyboardButton("Online payment", callback_data="mode:online")],
-        [InlineKeyboardButton("Change time", callback_data="change-date")],
+        _main_menu_row(),
     ])
 
 
@@ -339,29 +457,47 @@ def _confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Confirm booking", callback_data="confirm-booking")],
         [InlineKeyboardButton("Change payment method", callback_data="change-mode")],
+        _main_menu_row(),
     ])
+
+
+def _current_service(booking: dict) -> dict | None:
+    order = booking.get("service_order") or []
+    index = booking.get("schedule_index", 0)
+    if index >= len(order):
+        return None
+    return booking.get("services", {}).get(order[index])
+
+
+def _schedule_lines(booking: dict, timezone_name: str) -> list[str]:
+    rows = []
+    for service_id in booking.get("service_order") or []:
+        service = booking.get("services", {}).get(service_id) or {}
+        scheduled = (booking.get("schedule") or {}).get(service_id) or {}
+        rows.append(
+            f"• {service.get('name', 'Service')} · "
+            f"{_when_text(scheduled.get('start_at'), timezone_name)}"
+        )
+    return rows
 
 
 async def _review_text(context, patient: dict) -> tuple[str, dict]:
     booking = context.user_data["booking"]
-    services, total, duration = _selected_summary(booking)
-    slot = booking["slot"]
+    services, total, _duration = _selected_summary(booking)
     clinic = await asyncio.to_thread(get_active_clinic, patient["clinic_id"])
-    when = _when_text(slot["start_at"], clinic.timezone)
     mode = booking.get("payment_mode")
     mode_text = "Cash in hand · unpaid" if mode == "cash" else "Online payment · awaiting receipt"
     doctor = booking.get("dentists", {}).get(booking.get("dentist_id"), "—")
+    schedule = _schedule_lines(booking, clinic.timezone)
     text = (
         "Review your booking before confirming:\n\n"
-        f"Services: {', '.join(row['name'] for row in services)}\n"
-        f"Duration: {duration} minutes\n"
         f"Doctor: {doctor}\n"
-        f"When: {when}\n"
-        f"Bill: {_money(total, booking.get('currency') or 'AED')}\n"
+        + "\n".join(schedule)
+        + f"\n\nTotal bill: {_money(total, booking.get('currency') or 'AED')}\n"
         f"Payment: {mode_text}\n\n"
-        "Selected services cannot be edited after you confirm."
+        "⚠️ You cannot edit the selected services once you confirm."
     )
-    return text, {"services": services, "total": total, "duration": duration}
+    return text, {"services": services, "total": total}
 
 
 async def _callbacks(update, context):
@@ -369,12 +505,61 @@ async def _callbacks(update, context):
         return
     query = update.callback_query
     await query.answer()
+    data = query.data or ""
+
+    if data == "main-menu":
+        _clear_flow(context)
+        await query.message.reply_text("Main menu", reply_markup=_menu())
+        return
+
+    if data.startswith("cancel-request:"):
+        request_id = data.removeprefix("cancel-request:")
+        expected = context.user_data.get("cancel_status", {}).get(request_id)
+        if not expected:
+            await query.edit_message_text("That booking request is no longer available to cancel.")
+            return
+        try:
+            await asyncio.to_thread(lambda: _client().rpc("transition_booking_request", {
+                "p_booking_request_id": request_id, "p_expected_status": expected,
+                "p_target_status": "cancelled"}).execute())
+            await query.edit_message_text("Booking request cancelled.")
+        except Exception:
+            logger.exception("Telegram booking request cancellation failed")
+            await query.edit_message_text("The request could not be cancelled. Check its current status.")
+        return
+
+    if data.startswith("cancel-appointment:"):
+        appointment_id = data.removeprefix("cancel-appointment:")
+        stored = context.user_data.get("cancel_appointments", {}).get(appointment_id)
+        if not stored:
+            await query.edit_message_text("That appointment is no longer available to cancel.")
+            return
+        try:
+            result = await asyncio.to_thread(
+                cancel_appointment,
+                stored["clinic_id"],
+                stored["contact_id"],
+                appointment_id,
+                actor=AppointmentActor(actor_type=AppointmentActorType.PATIENT, actor_id=stored["patient_id"]),
+            )
+            ok = result.status.value in {"CANCELLED", "ALREADY_CANCELLED"}
+            if ok:
+                await asyncio.to_thread(
+                    lambda: _client().table("outbound_notifications").update({"status": "cancelled"})
+                    .eq("clinic_id", stored["clinic_id"])
+                    .eq("appointment_id", appointment_id)
+                    .eq("status", "pending").execute()
+                )
+            await query.edit_message_text("Appointment cancelled." if ok else (result.reason or "The appointment could not be cancelled."))
+        except Exception:
+            logger.exception("Telegram appointment cancellation failed")
+            await query.edit_message_text("The appointment could not be cancelled right now.")
+        return
+
     patient = context.user_data.get("patient")
     if not patient:
-        await query.edit_message_text("Please verify your patient record first with @ Book appointment.")
+        await query.edit_message_text("Please start again with @ Book appointment.")
         return
-    client = _client()
-    data = query.data or ""
 
     if data.startswith("toggle:"):
         booking = context.user_data.get("booking")
@@ -435,9 +620,15 @@ async def _callbacks(update, context):
             await query.edit_message_text("That doctor selection expired. Please start booking again.")
             return
         booking["dentist_id"] = doctor_id
+        booking["schedule"] = {}
+        booking["service_order"] = list(booking.get("selected") or [])
+        booking["schedule_index"] = 0
         context.user_data[STATE] = "date"
+        service = _current_service(booking)
         await query.edit_message_text(
-            f"Selected {booking['dentists'][doctor_id]}. Send a date as YYYY-MM-DD."
+            f"Selected {booking['dentists'][doctor_id]}.\n"
+            f"Send the date for {service['name']} as YYYY-MM-DD.",
+            reply_markup=InlineKeyboardMarkup([_main_menu_row()]),
         )
         return
 
@@ -448,19 +639,37 @@ async def _callbacks(update, context):
         except (KeyError, ValueError, IndexError):
             await query.edit_message_text("That time choice expired. Please check availability again.")
             return
-        booking["slot"] = {"start_at": slot.start_at.isoformat(), "end_at": slot.end_at.isoformat()}
+        service = _current_service(booking)
+        if not service:
+            await query.edit_message_text("Your booking details expired. Please start again with @ Book appointment.")
+            return
+        booking.setdefault("schedule", {})[service["id"]] = {
+            "start_at": slot.start_at.isoformat(),
+            "end_at": slot.end_at.isoformat(),
+        }
+        booking["schedule_index"] = booking.get("schedule_index", 0) + 1
         context.user_data.pop("slots", None)
+        next_service = _current_service(booking)
+        if next_service:
+            context.user_data[STATE] = "date"
+            await query.edit_message_text(
+                f"Saved {service['name']}.\n"
+                f"Send the date for {next_service['name']} as YYYY-MM-DD "
+                "(it will be scheduled after the previous service).",
+                reply_markup=InlineKeyboardMarkup([_main_menu_row()]),
+            )
+            return
+        context.user_data.pop(STATE, None)
+        services, total, _duration = _selected_summary(booking)
+        clinic = await asyncio.to_thread(get_active_clinic, patient["clinic_id"])
+        schedule_text = "\n".join(_schedule_lines(booking, clinic.timezone))
         await query.edit_message_text(
+            f"{schedule_text}\n\nTotal bill: {_money(total, booking.get('currency') or 'AED')}\n"
             "How would you like to pay?\n"
-            "• Cash in hand: the booking is confirmed immediately as unpaid and you pay at the clinic.\n"
-            "• Online payment: upload a receipt, and the clinic verifies it before confirming.",
+            "• Cash in hand: confirmed immediately as unpaid, paid at the clinic.\n"
+            "• Online payment: upload a receipt for clinic verification.",
             reply_markup=_payment_keyboard(),
         )
-        return
-
-    if data == "change-date":
-        context.user_data[STATE] = "date"
-        await query.edit_message_text("Send the appointment date as YYYY-MM-DD.")
         return
 
     if data.startswith("mode:"):
@@ -476,15 +685,12 @@ async def _callbacks(update, context):
         return
 
     if data == "change-mode":
-        await query.edit_message_text(
-            "How would you like to pay?",
-            reply_markup=_payment_keyboard(),
-        )
+        await query.edit_message_text("How would you like to pay?", reply_markup=_payment_keyboard())
         return
 
     if data == "confirm-booking":
         booking = context.user_data.get("booking") or {}
-        if not booking.get("selected") or not booking.get("dentist_id") or not booking.get("slot"):
+        if not booking.get("selected") or not booking.get("dentist_id") or not booking.get("schedule"):
             await query.edit_message_text("Your booking details expired. Please start again with @ Book appointment.")
             return
         try:
@@ -499,12 +705,29 @@ async def _callbacks(update, context):
             await query.message.reply_text(describe_active_booking(existing), reply_markup=_menu())
             return
 
-        services, total, _duration = _selected_summary(booking)
-        start_at = _parse_ts(booking["slot"]["start_at"])
-        end_at = _parse_ts(booking["slot"]["end_at"])
-        if start_at is None or end_at is None:
-            await query.edit_message_text("The selected time expired. Please check availability again.")
+        services = []
+        for service_id in booking.get("service_order") or []:
+            service = booking.get("services", {}).get(service_id) or {}
+            scheduled = (booking.get("schedule") or {}).get(service_id) or {}
+            services.append({
+                "service_id": service_id,
+                "name": service.get("name"),
+                "price_amount": float(service.get("price_from") or 0),
+                "duration_minutes": service.get("duration_minutes"),
+                "currency": service.get("currency") or "AED",
+                "dentist_id": booking.get("dentist_id"),
+                "start_at": scheduled.get("start_at"),
+                "end_at": scheduled.get("end_at"),
+            })
+        starts = [_parse_ts(item["start_at"]) for item in services]
+        ends = [_parse_ts(item["end_at"]) for item in services]
+        starts = [value for value in starts if value is not None]
+        ends = [value for value in ends if value is not None]
+        if not starts or not ends:
+            await query.edit_message_text("The selected times expired. Please start booking again.")
             return
+        start_at, end_at = min(starts), max(ends)
+        total = sum(item["price_amount"] for item in services)
         try:
             request = await asyncio.to_thread(
                 create_booking_request,
@@ -532,7 +755,7 @@ async def _callbacks(update, context):
                 )
             except Exception:
                 logger.exception("Telegram cash booking confirmation failed", extra={"request_id": request["id"]})
-                await query.edit_message_text(
+                await query.message.reply_text(
                     "Your booking is saved, but confirmation is delayed. Check @ Booking status shortly.",
                     reply_markup=_menu(),
                 )
@@ -545,46 +768,10 @@ async def _callbacks(update, context):
         context.user_data["request_id"] = request["id"]
         context.user_data["booking"] = booking
         context.user_data[STATE] = "payment"
-        await query.edit_message_text(
-            f"Booking request saved for {_when_text(booking['slot']['start_at'], 'UTC')}.\n"
-            f"Upload your receipt for {_money(total, booking.get('currency') or 'AED')}. "
-            "The clinic verifies online payments before confirming the appointment.",
+        await query.message.reply_text(
+            f"Booking request saved. Total bill: {_money(total, booking.get('currency') or 'AED')}.\n"
+            "Upload your receipt for this bill. The clinic verifies online payments before confirming.",
         )
-        return
-
-    if data.startswith("cancel-request:"):
-        request_id = data.removeprefix("cancel-request:")
-        expected = context.user_data.get("cancel_status", {}).get(request_id)
-        if not expected:
-            await query.edit_message_text("That booking request is no longer available to cancel.")
-            return
-        try:
-            await asyncio.to_thread(lambda: client.rpc("transition_booking_request", {
-                "p_booking_request_id": request_id, "p_expected_status": expected,
-                "p_target_status": "cancelled"}).execute())
-            await query.edit_message_text("Booking request cancelled.")
-        except Exception:
-            logger.exception("Telegram booking request cancellation failed")
-            await query.edit_message_text("The request could not be cancelled. Check its current status.")
-        return
-
-    if data.startswith("cancel-appointment:"):
-        try:
-            result = await asyncio.to_thread(cancel_appointment, patient["clinic_id"], patient["contact_id"],
-                data.removeprefix("cancel-appointment:"),
-                actor=AppointmentActor(actor_type=AppointmentActorType.PATIENT, actor_id=patient["patient_id"]))
-            ok = result.status.value in {"CANCELLED", "ALREADY_CANCELLED"}
-            if ok:
-                await asyncio.to_thread(
-                    lambda: client.table("outbound_notifications").update({"status": "cancelled"})
-                    .eq("clinic_id", patient["clinic_id"])
-                    .eq("appointment_id", data.removeprefix("cancel-appointment:"))
-                    .eq("status", "pending").execute()
-                )
-            await query.edit_message_text("Appointment cancelled." if ok else (result.reason or "The appointment could not be cancelled."))
-        except Exception:
-            logger.exception("Telegram appointment cancellation failed")
-            await query.edit_message_text("The appointment could not be cancelled right now.")
         return
 
 
@@ -597,12 +784,16 @@ async def _confirmation_text(patient: dict, result: dict, request: dict) -> str:
     when = _when_text(appointment.get("start_at") or request.get("preferred_window_start"), clinic.timezone)
     mode = appointment.get("payment_mode") or request.get("payment_mode") or "cash"
     payment_status = appointment.get("payment_status") or "unpaid"
+    schedule = "\n".join(
+        f"• {line.get('service_name')} · {_when_text(line.get('start_at'), clinic.timezone)}"
+        for line in services
+    )
     return (
         "Appointment confirmed\n\n"
         f"Reference: {appointment.get('appointment_reference') or '—'}\n"
         f"When: {when}\n"
         f"Doctor: {result.get('dentist_name') or '—'}\n"
-        f"Services: {_service_names(services)}\n"
+        f"Services:\n{schedule}\n"
         f"Bill: {_money(appointment.get('total_amount') if appointment.get('total_amount') is not None else request.get('total_amount'), appointment.get('currency') or request.get('currency') or 'AED')}\n"
         f"Payment: {mode} · {payment_status}\n"
         f"Status: {appointment.get('status') or 'confirmed'}"
@@ -614,23 +805,29 @@ async def _find_slots(update, context):
     try:
         requested_date = date.fromisoformat(msg.text.strip())
         patient, booking = context.user_data["patient"], context.user_data["booking"]
-        services, _total, duration = _selected_summary(booking)
-        if not services:
+        service = _current_service(booking)
+        if not service:
             context.user_data.pop(STATE, None)
             await msg.reply_text("Your service selection expired. Please start booking again.", reply_markup=_menu())
             return
         clinic = await asyncio.to_thread(get_active_clinic, patient["clinic_id"])
         tz = ZoneInfo(clinic.timezone)
-        start = datetime.combine(requested_date, time.min, tzinfo=tz)
+        day_start = datetime.combine(requested_date, time.min, tzinfo=tz)
+        previous_ends = [
+            _parse_ts(value.get("end_at"))
+            for value in (booking.get("schedule") or {}).values()
+        ]
+        previous_ends = [value for value in previous_ends if value is not None]
+        window_start = max([day_start, *previous_ends])
         result = await asyncio.to_thread(
             find_available_slots,
             patient["clinic_id"],
             booking["dentist_id"],
             None,
-            start,
-            start + timedelta(days=1),
+            window_start,
+            window_start + timedelta(days=1),
             20,
-            duration_override_minutes=duration,
+            duration_override_minutes=int(service["duration_minutes"]),
         )
     except ValueError:
         await msg.reply_text("Send the date as YYYY-MM-DD.")
@@ -640,7 +837,7 @@ async def _find_slots(update, context):
         await msg.reply_text("I couldn't check availability right now. Please try later.")
         return
     if not result.slots:
-        await msg.reply_text("No available times for that doctor on this date. Send another date.")
+        await msg.reply_text("No available times for that doctor from this date. Send another date.")
         return
     context.user_data["slots"] = result.slots
     rows = [
@@ -650,7 +847,8 @@ async def _find_slots(update, context):
         )]
         for i, slot in enumerate(result.slots)
     ]
-    await msg.reply_text("Choose an available time:", reply_markup=InlineKeyboardMarkup(rows))
+    rows.append(_main_menu_row())
+    await msg.reply_text(f"Choose a time for {service['name']}:", reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def _submit_receipt(update, context):
@@ -728,22 +926,25 @@ def _store_receipt(patient, request_id, payload, mime, extension):
         raise
 
 
-async def _status(update, patient):
+async def _status(update, patient_ids: list[str]):
+    if not patient_ids:
+        await update.effective_message.reply_text("No booking was found for that phone number or email.",
+                                                   reply_markup=_menu())
+        return
     client = _client()
     try:
-        clinic = await asyncio.to_thread(get_active_clinic, patient["clinic_id"])
+        clinic = await asyncio.to_thread(get_active_clinic, _clinic_id())
         requests = await asyncio.to_thread(lambda: client.table("booking_requests").select(
             "id,status,preferred_date,preferred_dentist_id,preferred_window_start,preferred_window_end,"
             "service_id,total_amount,currency,payment_mode,payment_status,created_at,"
-            "booking_request_services(service_name),dentists(name)").eq(
-            "clinic_id", patient["clinic_id"]).eq(
-            "patient_id", patient["patient_id"]).order("created_at", desc=True).limit(10).execute().data or [])
+            "booking_request_services(service_name,start_at,end_at),dentists(name)").eq(
+            "clinic_id", _clinic_id()).in_("patient_id", patient_ids).order("created_at", desc=True).limit(10).execute().data or [])
         request_notes = []
         for request in requests:
             if request["status"] in {"payment_verified", "awaiting_slot_selection"}:
                 try:
                     result = await asyncio.to_thread(
-                        finalize_booking_request, patient["clinic_id"], request["id"]
+                        finalize_booking_request, _clinic_id(), request["id"]
                     )
                     if result.get("status") == "confirmed":
                         request["status"] = "converted_to_appointment"
@@ -756,10 +957,9 @@ async def _status(update, patient):
 
         appointments = await asyncio.to_thread(lambda: client.table("appointments").select(
             "id,appointment_reference,status,start_at,end_at,service_id,total_amount,currency,"
-            "payment_mode,payment_status,dentists(name),appointment_services(service_name),"
+            "payment_mode,payment_status,dentists(name),appointment_services(service_name,start_at,end_at),"
             "appointment_visits(queue_status)").eq(
-            "clinic_id", patient["clinic_id"]).eq(
-            "patient_id", patient["patient_id"]).order("start_at", desc=True).limit(10).execute().data or [])
+            "clinic_id", _clinic_id()).in_("patient_id", patient_ids).order("start_at", desc=True).limit(10).execute().data or [])
 
         if request_notes:
             await update.effective_message.reply_text("\n".join(request_notes))
@@ -769,7 +969,7 @@ async def _status(update, patient):
             doctor = (request.get("dentists") or {}).get("name") or "doctor pending"
             when = _when_text(request.get("preferred_window_start"), clinic.timezone)
             lines.append(
-                f"• Request {request['id'][:8]} · {services} · {when} · "
+                f"• Request {request['id'][:8]} · {services} · {when} · {doctor} · "
                 f"{request['status'].replace('_', ' ')} · {request.get('payment_mode') or 'payment pending'} "
                 f"{request.get('payment_status') or 'unpaid'}"
             )
@@ -784,48 +984,75 @@ async def _status(update, patient):
                 f"{appointment.get('payment_mode') or 'payment pending'} {appointment.get('payment_status') or 'unpaid'}"
                 + (f" · queue {queue}" if queue else "")
             )
-        await update.effective_message.reply_text("\n".join(lines) if lines else "No bookings found.", reply_markup=_menu())
+        await update.effective_message.reply_text("\n".join(lines) if lines else "No bookings found.",
+                                                   reply_markup=_menu())
     except Exception:
         logger.exception("Telegram booking status lookup failed")
         await update.effective_message.reply_text("Booking status is temporarily unavailable.")
 
 
-async def _payments(update, patient):
+async def _payments(update, patient_ids: list[str]):
+    if not patient_ids:
+        await update.effective_message.reply_text("You did not pay your bill yet.", reply_markup=_menu())
+        return
     client = _client()
     try:
         rows = await asyncio.to_thread(lambda: client.table("payments").select(
             "booking_request_id,amount_expected,currency,status,method,proof_storage_path").eq(
-            "clinic_id", patient["clinic_id"]).eq("patient_id", patient["patient_id"]).order(
+            "clinic_id", _clinic_id()).in_("patient_id", patient_ids).order(
             "created_at", desc=True).limit(10).execute().data or [])
-        lines = ["Your uploaded payments:"]
-        for row in rows:
-            amount = f"{row.get('currency', 'AED')} {row['amount_expected']}" if row.get("amount_expected") is not None else "amount pending"
-            text = f"• {amount} · {row.get('method') or 'online'} · {row['status']} · request {row['booking_request_id'][:8]}"
+        paid = [row for row in rows if row["status"] == "verified"]
+        if not paid:
+            pending = any(row["status"] in {"submitted", "awaiting"} for row in rows)
+            message = "You did not pay your bill yet."
+            if pending:
+                message += "\nYour uploaded receipt is awaiting clinic verification."
+            await update.effective_message.reply_text(message, reply_markup=_menu())
+            return
+        lines = ["Your paid bills:"]
+        for row in paid:
+            amount = _money(row.get("amount_expected"), row.get("currency") or "AED")
+            text = f"• {amount} · {row.get('method') or 'online'} · paid · request {row['booking_request_id'][:8]}"
             path = row.get("proof_storage_path")
             if path:
                 signed = await asyncio.to_thread(lambda p=path: client.storage.from_(BUCKET).create_signed_url(p, 300))
                 url = signed.get("signedURL") or signed.get("signedUrl")
                 if url:
                     text += f"\n  Receipt: {url}"
+            elif (row.get("method") or "online") == "cash":
+                text += "\n  Cash payment recorded at the clinic (no online receipt)."
             lines.append(text)
-        await update.effective_message.reply_text("\n".join(lines) if len(lines) > 1 else "No uploaded payments found.",
-                                                   reply_markup=_menu(), disable_web_page_preview=True)
+        await update.effective_message.reply_text("\n".join(lines), reply_markup=_menu(),
+                                                   disable_web_page_preview=True)
     except Exception:
         logger.exception("Telegram payment listing failed")
         await update.effective_message.reply_text("Uploaded payments are temporarily unavailable.")
 
 
-async def _cancel_menu(update, patient, context):
+async def _cancel_menu(update, patient_ids: list[str], contact_ids: list[str], context):
+    if not patient_ids:
+        await update.effective_message.reply_text("No booking was found for that phone number or email.",
+                                                   reply_markup=_menu())
+        return
     client = _client()
     try:
         requests = await asyncio.to_thread(lambda: client.table("booking_requests").select("id,status").eq(
-            "clinic_id", patient["clinic_id"]).eq("patient_id", patient["patient_id"]).in_("status", [
+            "clinic_id", _clinic_id()).in_("patient_id", patient_ids).in_("status", [
             "awaiting_patient_info", "awaiting_payment", "payment_submitted", "payment_rejected",
             "payment_verified", "awaiting_slot_selection"]).limit(10).execute().data or [])
-        appointments = await asyncio.to_thread(lambda: client.table("appointments").select("id,start_at").eq(
-            "clinic_id", patient["clinic_id"]).eq("contact_id", patient["contact_id"]).in_(
+        appointments = await asyncio.to_thread(lambda: client.table("appointments").select(
+            "id,start_at,contact_id,patient_id").eq(
+            "clinic_id", _clinic_id()).in_("patient_id", patient_ids).in_(
             "status", ["pending", "confirmed"]).limit(10).execute().data or [])
         context.user_data["cancel_status"] = {r["id"]: r["status"] for r in requests}
+        context.user_data["cancel_appointments"] = {
+            a["id"]: {
+                "clinic_id": _clinic_id(),
+                "contact_id": a["contact_id"],
+                "patient_id": a["patient_id"],
+            }
+            for a in appointments
+        }
         buttons = [[InlineKeyboardButton(f"Request {r['id'][:8]} · {r['status'].replace('_', ' ')}",
                                           callback_data=f"cancel-request:{r['id']}")] for r in requests]
         buttons += [[InlineKeyboardButton(f"Appointment {a['id'][:8]} · {a['start_at'][:16]}",
@@ -855,32 +1082,32 @@ async def _text(update, context):
         return
     state, text = context.user_data.get(STATE), msg.text.strip()
     if text in {item for row in MENU for item in row}:
-        if text == "@ Main menu":
-            context.user_data.pop(STATE, None)
-            await msg.reply_text("Main menu", reply_markup=_menu())
-        elif text == "@ See services":
+        if text == "@ See services":
             await _services(update)
         elif text == "@ See doctors":
             await _doctors(update)
         elif text == "@ Book appointment":
             await _begin_booking(update, context)
         elif text == "@ Booking status":
-            patient = await _require_patient(update, context)
-            if patient: await _status(update, patient)
+            await _begin_lookup(update, context, "status")
         elif text == "@ Cancel booking":
-            patient = await _require_patient(update, context)
-            if patient: await _cancel_menu(update, patient, context)
+            await _begin_lookup(update, context, "cancel")
         elif text == "@ Uploaded payments":
-            patient = await _require_patient(update, context)
-            if patient: await _payments(update, patient)
+            await _begin_lookup(update, context, "payments")
         elif text == "@ Ask MarinaSmileAI":
             context.user_data[STATE] = "ai"
             await msg.reply_text("Ask MarinaSmileAI a question about the clinic.")
         return
-    if state == "identifier":
-        await _verify_identifier(update, context)
-    elif state == "name":
-        await _verify_name(update, context)
+    if text.casefold() in {"main menu", "menu", "home"}:
+        _clear_flow(context)
+        await msg.reply_text("Main menu", reply_markup=_menu())
+        return
+    if state == "booking_identifier":
+        await _verify_booking_identifier(update, context)
+    elif state == "booking_name":
+        await _verify_booking_name(update, context)
+    elif state == "lookup_identifier":
+        await _verify_lookup_identifier(update, context)
     elif state == "date":
         await _find_slots(update, context)
     elif state == "payment":
@@ -958,7 +1185,7 @@ async def stop_polling_bot(application: Application) -> None:
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     logger.info("Starting Marina Smile Telegram bot polling")
     build_application().run_polling()
 

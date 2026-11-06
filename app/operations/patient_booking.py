@@ -40,6 +40,20 @@ def normalize_phone(value: str) -> str:
     return re.sub(r"\D", "", value)
 
 
+def phone_matches(left: str | None, right: str | None) -> bool:
+    """Accept local and international forms of the same number.
+
+    Examples that match: +92 311-8917906, 923118917906, 03118917906.
+    """
+    first = normalize_phone(left or "")
+    second = normalize_phone(right or "")
+    if not first or not second:
+        return False
+    if first == second:
+        return True
+    return len(first) >= 9 and len(second) >= 9 and first[-9:] == second[-9:]
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -56,12 +70,12 @@ def _single_row(data: Any) -> dict | None:
     return data or None
 
 
-def _find_contact(
+def _find_contacts(
     supabase: Client,
     clinic_id: str,
     identifier_type: str,
     identifier: str,
-) -> dict | None:
+) -> list[dict]:
     rows = (
         supabase.table("contacts")
         .select("id,phone_number,email,telegram_chat_id,name")
@@ -77,14 +91,48 @@ def _find_contact(
             if value and value == identifier:
                 matches.append(row)
         else:
-            value = normalize_phone(row.get("phone_number") or "")
-            if value and value == identifier:
+            if phone_matches(row.get("phone_number"), identifier):
                 matches.append(row)
+    return matches
+
+
+def _find_contact(
+    supabase: Client,
+    clinic_id: str,
+    identifier_type: str,
+    identifier: str,
+) -> dict | None:
+    matches = _find_contacts(supabase, clinic_id, identifier_type, identifier)
     if len(matches) > 1:
         raise PatientBookingError(
             "More than one clinic contact matches that phone or email. Please contact reception."
         )
     return matches[0] if matches else None
+
+
+def lookup_identities(
+    clinic_id: str,
+    identifier_type: str,
+    identifier: str,
+    *,
+    client: Client | None = None,
+) -> dict:
+    """Find any contact and patients already registered with a phone/email."""
+    supabase = client or get_supabase_client()
+    contacts = _find_contacts(supabase, clinic_id, identifier_type, identifier)
+    if not contacts:
+        return {"contacts": [], "patients": []}
+    contact_ids = [contact["id"] for contact in contacts]
+    patients = (
+        supabase.table("patients")
+        .select("id,full_name,primary_contact_id,active")
+        .eq("clinic_id", clinic_id)
+        .in_("primary_contact_id", contact_ids)
+        .execute()
+        .data
+        or []
+    )
+    return {"contacts": contacts, "patients": patients}
 
 
 def resolve_or_register_patient(
@@ -304,6 +352,9 @@ def create_booking_request(
             "price_amount": service.get("price_amount") or 0,
             "duration_minutes": service["duration_minutes"],
             "currency": service.get("currency") or currency,
+            "dentist_id": service.get("dentist_id") or dentist_id,
+            "start_at": service.get("start_at"),
+            "end_at": service.get("end_at"),
         }
         for service in services
     ]
@@ -316,7 +367,10 @@ def _booking_lines(
 ) -> list[dict]:
     lines = (
         supabase.table("booking_request_services")
-        .select("service_id,service_name,price_amount,duration_minutes,currency")
+        .select(
+            "service_id,service_name,price_amount,duration_minutes,currency,"
+            "dentist_id,start_at,end_at"
+        )
         .eq("clinic_id", clinic_id)
         .eq("booking_request_id", request["id"])
         .execute()
@@ -345,8 +399,32 @@ def _booking_lines(
             "price_amount": row.get("price_from") or 0,
             "duration_minutes": row["duration_minutes"],
             "currency": row.get("currency") or "AED",
+            "dentist_id": request.get("preferred_dentist_id"),
+            "start_at": request.get("preferred_window_start"),
+            "end_at": request.get("preferred_window_end"),
         }
     ]
+
+
+def _apply_service_schedule(
+    supabase: Client,
+    clinic_id: str,
+    appointment_id: str,
+    services: list[dict],
+) -> None:
+    """Copy per-service doctor/time from the request onto the appointment."""
+    for line in services:
+        if not line.get("start_at") or not line.get("end_at"):
+            continue
+        supabase.table("appointment_services").update(
+            {
+                "dentist_id": line.get("dentist_id"),
+                "start_at": line["start_at"],
+                "end_at": line["end_at"],
+            }
+        ).eq("clinic_id", clinic_id).eq("appointment_id", appointment_id).eq(
+            "service_id", line["service_id"]
+        ).execute()
 
 
 def _schedule_reminder(
@@ -440,11 +518,13 @@ def finalize_booking_request(
     if existing:
         appointment = existing[0]
         if appointment["status"] == "confirmed":
+            services = _booking_lines(supabase, clinic_id, request)
+            _apply_service_schedule(supabase, clinic_id, appointment["id"], services)
             return {
                 "status": "confirmed",
                 "appointment": appointment,
                 "request": request,
-                "services": _booking_lines(supabase, clinic_id, request),
+                "services": services,
             }
         return {
             "status": "in_progress",
@@ -583,6 +663,8 @@ def finalize_booking_request(
             .data
         )
         appointment = _single_row(confirmed) or appointment
+
+    _apply_service_schedule(supabase, clinic_id, appointment["id"], services)
 
     if request.get("payment_mode") == "online":
         supabase.table("booking_requests").update({"payment_status": "paid"}).eq(
