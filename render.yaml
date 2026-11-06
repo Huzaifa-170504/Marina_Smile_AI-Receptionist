@@ -9,21 +9,33 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.8
-      - key: SUPABASE_URL
+
+      - key: TELEGRAM_BOT_TOKEN
         sync: false
+
+      - key: SUPABASE_URL
+        value: https://lpsjfkyixoubhrryaadk.supabase.co
+
       - key: SUPABASE_SECRET_KEY
         sync: false
+
       - key: GEMINI_API_KEY
         sync: false
+
       - key: GOOGLE_APPLICATION_CREDENTIALS
-        sync: false
+        value: /etc/secrets/google-service-account.json
+
       - key: DASHBOARD_ALLOWED_ORIGINS
-        sync: false
+        value: https://marinasmileai-receptionist.vercel.app
+
       - key: DASHBOARD_APPLICATION_URL
-        sync: false
+        value: https://marinasmileai-receptionist.vercel.app
+
       - key: DEMO_ENABLED
         value: "true"
+
       - key: DEMO_API_TOKEN
         sync: false
+
       - key: RAG_MATCH_THRESHOLD
         value: "0.60"
