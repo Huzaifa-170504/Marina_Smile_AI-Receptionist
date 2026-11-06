@@ -102,6 +102,14 @@ def _money(amount, currency="AED") -> str:
     return f"{currency} {float(amount):,.2f}"
 
 
+def _patient_profile(patient: dict) -> str:
+    age = patient.get("age_at_registration")
+    age_text = f"Age: {age}" if age is not None else "Age: not provided"
+    gender = patient.get("gender")
+    gender_text = f"Gender: {gender}" if gender else "Gender: not provided"
+    return f"{patient.get('full_name') or patient.get('name') or 'Patient'} · {age_text} · {gender_text}"
+
+
 def _service_names(rows) -> str:
     names = []
     for row in rows or []:
@@ -148,6 +156,7 @@ def _clear_flow(context):
         "patient",
         "booking_identifier",
         "booking_patients",
+        "booking_pending",
         "lookup_target",
         "request_id",
         "cancel_status",
@@ -206,8 +215,10 @@ async def _continue_booking_identifier(update, context):
         "contact_id": patients[0]["primary_contact_id"],
         "patient_id": patients[0]["id"],
         "name": patients[0]["full_name"],
+        "age_at_registration": patients[0].get("age_at_registration"),
+        "gender": patients[0].get("gender"),
     }
-    await _after_patient_verified(update, context, patient)
+    await _maybe_complete_profile(update, context, patient)
 
 
 async def _verify_booking_identifier(update, context):
@@ -239,53 +250,173 @@ async def _verify_booking_name(update, context):
             "contact_id": matches[0]["primary_contact_id"],
             "patient_id": matches[0]["id"],
             "name": matches[0]["full_name"],
+            "age_at_registration": matches[0].get("age_at_registration"),
+            "gender": matches[0].get("gender"),
         }
-    else:
-        identifier = context.user_data.get("booking_identifier")
-        if not identifier:
-            _clear_flow(context)
-            await update.effective_message.reply_text("Please start again with @ Book appointment.", reply_markup=_menu())
-            return
-        try:
-            patient = await asyncio.to_thread(
-                resolve_or_register_patient,
-                _clinic_id(),
-                identifier[0],
-                identifier[1],
-                name,
-                telegram_chat_id=update.effective_chat.id if update.effective_chat else None,
-            )
-        except PatientBookingError as exc:
-            await update.effective_message.reply_text(str(exc), reply_markup=_menu())
-            return
-        except Exception:
-            logger.exception("Telegram patient registration failed")
-            await update.effective_message.reply_text("I couldn't save your patient record. Please try later.")
-            return
+        await _maybe_complete_profile(update, context, patient)
+        return
+
+    identifier = context.user_data.get("booking_identifier")
+    if not identifier:
+        _clear_flow(context)
+        await update.effective_message.reply_text("Please start again with @ Book appointment.", reply_markup=_menu())
+        return
+    context.user_data["booking_pending"] = {
+        "identifier": identifier,
+        "name": name,
+        "patient": None,
+        "age": None,
+        "gender": None,
+        "chat_id": update.effective_chat.id if update.effective_chat else None,
+    }
+    context.user_data[STATE] = "booking_age"
+    await update.effective_message.reply_text("Enter the patient's age in years (for example: 30).")
+
+
+def _gender_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Male", callback_data="gender:male"),
+            InlineKeyboardButton("Female", callback_data="gender:female"),
+            InlineKeyboardButton("Other", callback_data="gender:other"),
+        ],
+        _main_menu_row(),
+    ])
+
+
+async def _maybe_complete_profile(update, context, patient: dict):
+    if patient.get("age_at_registration") is None:
+        context.user_data["booking_pending"] = {
+            "identifier": context.user_data.get("booking_identifier"),
+            "patient": patient,
+            "age": None,
+            "gender": None,
+            "chat_id": update.effective_chat.id if update.effective_chat else None,
+        }
+        context.user_data[STATE] = "booking_age"
+        await update.effective_message.reply_text("Enter the patient's age in years (for example: 30).")
+        return
+    if not patient.get("gender"):
+        context.user_data["booking_pending"] = {
+            "identifier": context.user_data.get("booking_identifier"),
+            "patient": patient,
+            "age": patient.get("age_at_registration"),
+            "gender": None,
+            "chat_id": update.effective_chat.id if update.effective_chat else None,
+        }
+        context.user_data[STATE] = "booking_gender"
+        await update.effective_message.reply_text(
+            "Select the patient's gender:", reply_markup=_gender_keyboard()
+        )
+        return
     await _after_patient_verified(update, context, patient)
 
 
-async def _after_patient_verified(update, context, patient):
+def _persist_profile(pending: dict, gender: str) -> dict:
+    patient = pending.get("patient")
+    age = pending.get("age")
+    if patient:
+        updates: dict = {"gender": gender}
+        if age is not None:
+            updates["age_at_registration"] = age
+        _client().table("patients").update(updates).eq(
+            "clinic_id", _clinic_id()
+        ).eq("id", patient["patient_id"]).execute()
+        patient.update(updates)
+        return patient
+    identifier = pending["identifier"]
+    return resolve_or_register_patient(
+        _clinic_id(),
+        identifier[0],
+        identifier[1],
+        pending["name"],
+        age_at_registration=age,
+        gender=gender,
+        telegram_chat_id=pending.get("chat_id"),
+    )
+
+
+async def _verify_booking_age(update, context):
+    try:
+        age = int((update.effective_message.text or "").strip())
+    except ValueError:
+        await update.effective_message.reply_text("Enter age as a whole number, for example: 30.")
+        return
+    if not 0 <= age <= 120:
+        await update.effective_message.reply_text("Enter a valid age between 0 and 120.")
+        return
+    pending = context.user_data.get("booking_pending")
+    if not pending:
+        _clear_flow(context)
+        await update.effective_message.reply_text("Please start again with @ Book appointment.", reply_markup=_menu())
+        return
+    pending["age"] = age
+    patient = pending.get("patient")
+    if patient and patient.get("gender"):
+        await _finish_profile(update, context, patient["gender"])
+        return
+    context.user_data[STATE] = "booking_gender"
+    await update.effective_message.reply_text(
+        "Select the patient's gender:", reply_markup=_gender_keyboard()
+    )
+
+
+async def _verify_booking_gender(update, context):
+    value = (update.effective_message.text or "").strip().casefold()
+    if value not in {"male", "female", "other"}:
+        await update.effective_message.reply_text(
+            "Enter gender as male, female, or other.", reply_markup=_gender_keyboard()
+        )
+        return
+    await _finish_profile(update, context, value)
+
+
+async def _finish_profile(update_or_query, context, gender: str):
+    pending = context.user_data.get("booking_pending")
+    if not pending:
+        _clear_flow(context)
+        return
+    try:
+        patient = await asyncio.to_thread(_persist_profile, pending, gender)
+    except PatientBookingError as exc:
+        context.user_data.pop("booking_pending", None)
+        context.user_data.pop(STATE, None)
+        method = getattr(update_or_query, "message", update_or_query).reply_text
+        await method(str(exc), reply_markup=_menu())
+        return
+    except Exception:
+        logger.exception("Telegram patient registration failed")
+        method = getattr(update_or_query, "message", update_or_query).reply_text
+        await method("I couldn't save your patient record. Please try later.")
+        return
+    context.user_data.pop("booking_pending", None)
+    context.user_data.pop(STATE, None)
+    message = getattr(update_or_query, "message", update_or_query)
+    await _after_patient_verified(update_or_query, context, patient, reply_message=message)
+
+
+async def _after_patient_verified(update, context, patient, reply_message=None):
     context.user_data["patient"] = patient
+    message = reply_message or getattr(update, "effective_message", None) or getattr(update, "message", None)
     try:
         existing = await asyncio.to_thread(
             active_booking_for_patient, patient["clinic_id"], patient["patient_id"]
         )
         if existing:
             _clear_flow(context)
-            await update.effective_message.reply_text(describe_active_booking(existing), reply_markup=_menu())
+            await message.reply_text(describe_active_booking(existing), reply_markup=_menu())
             return
         services = await asyncio.to_thread(_load_service_rows, patient["clinic_id"])
     except Exception:
         logger.exception("Telegram booking services lookup failed")
-        await update.effective_message.reply_text("Booking is temporarily unavailable.")
+        await message.reply_text("Booking is temporarily unavailable.")
         return
     if not services:
-        await update.effective_message.reply_text("No active services are available to book.", reply_markup=_menu())
+        await message.reply_text("No active services are available to book.", reply_markup=_menu())
         return
     context.user_data["booking"] = {"services": services, "selected": []}
     context.user_data[STATE] = "booking"
-    await update.effective_message.reply_text(
+    await message.reply_text(
         "Choose one or more services. Your bill is calculated automatically:",
         reply_markup=_service_keyboard(context.user_data["booking"]),
     )
@@ -321,14 +452,13 @@ async def _verify_lookup_identifier(update, context):
         )
         await update.effective_message.reply_text(message, reply_markup=_menu())
         return
-    patient_ids = [row["id"] for row in info.get("patients", [])]
-    contact_ids = [row["id"] for row in info.get("contacts", [])]
+    patients = info.get("patients", [])
     if target == "status":
-        await _status(update, patient_ids)
+        await _status(update, patients)
     elif target == "cancel":
-        await _cancel_menu(update, patient_ids, contact_ids, context)
+        await _cancel_menu(update, patients, context)
     elif target == "payments":
-        await _payments(update, patient_ids)
+        await _payments(update, patients)
 
 
 async def _begin_booking(update, context):
@@ -554,6 +684,15 @@ async def _callbacks(update, context):
         except Exception:
             logger.exception("Telegram appointment cancellation failed")
             await query.edit_message_text("The appointment could not be cancelled right now.")
+        return
+
+    if data.startswith("gender:"):
+        gender = data.removeprefix("gender:")
+        if gender not in {"male", "female", "other"}:
+            await query.edit_message_text("Select male, female, or other.")
+            return
+        await query.edit_message_text(f"Gender: {gender}. Saving your details…")
+        await _finish_profile(query, context, gender)
         return
 
     patient = context.user_data.get("patient")
@@ -926,7 +1065,8 @@ def _store_receipt(patient, request_id, payload, mime, extension):
         raise
 
 
-async def _status(update, patient_ids: list[str]):
+async def _status(update, patients: list[dict]):
+    patient_ids = [row["id"] for row in patients]
     if not patient_ids:
         await update.effective_message.reply_text("No booking was found for that phone number or email.",
                                                    reply_markup=_menu())
@@ -963,7 +1103,9 @@ async def _status(update, patient_ids: list[str]):
 
         if request_notes:
             await update.effective_message.reply_text("\n".join(request_notes))
-        lines = []
+        lines = [f"👤 {_patient_profile(row)}" for row in patients]
+        if lines:
+            lines.append("")
         for request in requests:
             services = _service_names(request.get("booking_request_services") or [])
             doctor = (request.get("dentists") or {}).get("name") or "doctor pending"
@@ -984,17 +1126,21 @@ async def _status(update, patient_ids: list[str]):
                 f"{appointment.get('payment_mode') or 'payment pending'} {appointment.get('payment_status') or 'unpaid'}"
                 + (f" · queue {queue}" if queue else "")
             )
-        await update.effective_message.reply_text("\n".join(lines) if lines else "No bookings found.",
-                                                   reply_markup=_menu())
+        has_bookings = any(line.startswith("• ") for line in lines)
+        if not has_bookings:
+            lines.append("No bookings found.")
+        await update.effective_message.reply_text("\n".join(lines), reply_markup=_menu())
     except Exception:
         logger.exception("Telegram booking status lookup failed")
         await update.effective_message.reply_text("Booking status is temporarily unavailable.")
 
 
-async def _payments(update, patient_ids: list[str]):
+async def _payments(update, patients: list[dict]):
+    patient_ids = [row["id"] for row in patients]
     if not patient_ids:
         await update.effective_message.reply_text("You did not pay your bill yet.", reply_markup=_menu())
         return
+    profile_lines = [f"👤 {_patient_profile(row)}" for row in patients]
     client = _client()
     try:
         rows = await asyncio.to_thread(lambda: client.table("payments").select(
@@ -1004,12 +1150,12 @@ async def _payments(update, patient_ids: list[str]):
         paid = [row for row in rows if row["status"] == "verified"]
         if not paid:
             pending = any(row["status"] in {"submitted", "awaiting"} for row in rows)
-            message = "You did not pay your bill yet."
+            message = "\n".join(profile_lines + ["", "You did not pay your bill yet."])
             if pending:
                 message += "\nYour uploaded receipt is awaiting clinic verification."
             await update.effective_message.reply_text(message, reply_markup=_menu())
             return
-        lines = ["Your paid bills:"]
+        lines = profile_lines + ["", "Your paid bills:"]
         for row in paid:
             amount = _money(row.get("amount_expected"), row.get("currency") or "AED")
             text = f"• {amount} · {row.get('method') or 'online'} · paid · request {row['booking_request_id'][:8]}"
@@ -1029,7 +1175,9 @@ async def _payments(update, patient_ids: list[str]):
         await update.effective_message.reply_text("Uploaded payments are temporarily unavailable.")
 
 
-async def _cancel_menu(update, patient_ids: list[str], contact_ids: list[str], context):
+async def _cancel_menu(update, patients: list[dict], context):
+    patient_ids = [row["id"] for row in patients]
+    profile_text = "\n".join(f"👤 {_patient_profile(row)}" for row in patients)
     if not patient_ids:
         await update.effective_message.reply_text("No booking was found for that phone number or email.",
                                                    reply_markup=_menu())
@@ -1057,7 +1205,8 @@ async def _cancel_menu(update, patient_ids: list[str], contact_ids: list[str], c
                                           callback_data=f"cancel-request:{r['id']}")] for r in requests]
         buttons += [[InlineKeyboardButton(f"Appointment {a['id'][:8]} · {a['start_at'][:16]}",
                                            callback_data=f"cancel-appointment:{a['id']}")] for a in appointments]
-        await update.effective_message.reply_text("Choose a booking to cancel:" if buttons else "No active bookings to cancel.",
+        heading = "Choose a booking to cancel:" if buttons else "No active bookings to cancel."
+        await update.effective_message.reply_text(f"{profile_text}\n\n{heading}",
             reply_markup=InlineKeyboardMarkup(buttons) if buttons else _menu())
     except Exception:
         logger.exception("Telegram cancellation lookup failed")
@@ -1106,6 +1255,10 @@ async def _text(update, context):
         await _verify_booking_identifier(update, context)
     elif state == "booking_name":
         await _verify_booking_name(update, context)
+    elif state == "booking_age":
+        await _verify_booking_age(update, context)
+    elif state == "booking_gender":
+        await _verify_booking_gender(update, context)
     elif state == "lookup_identifier":
         await _verify_lookup_identifier(update, context)
     elif state == "date":
