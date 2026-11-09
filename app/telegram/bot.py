@@ -63,6 +63,12 @@ def _main_menu_row():
     return [InlineKeyboardButton("🏠 Main menu", callback_data="main-menu")]
 
 
+def _appointments_shortcut():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Open My Appointments", callback_data="my-appointments")
+    ]])
+
+
 def _client():
     return get_supabase_client()
 
@@ -286,7 +292,11 @@ async def _start_service_selection(update, context, patient, reply_message=None)
             return
         if existing:
             _clear_flow(context)
-            await message.reply_text(describe_active_booking(existing), reply_markup=_menu())
+            context.user_data["lookup_patients"] = [patient]
+            await message.reply_text(
+                describe_active_booking(existing),
+                reply_markup=_appointments_shortcut(),
+            )
             return
     try:
         services = await asyncio.to_thread(_load_service_rows, _clinic_id())
@@ -484,7 +494,11 @@ async def _confirm_selected_booking(message, context):
         existing = None
     if existing:
         _clear_flow(context)
-        await message.reply_text(describe_active_booking(existing), reply_markup=_menu())
+        context.user_data["lookup_patients"] = [patient]
+        await message.reply_text(
+            describe_active_booking(existing),
+            reply_markup=_appointments_shortcut(),
+        )
         return
     services = _booking_services_with_times(booking)
     if not services:
@@ -795,6 +809,72 @@ async def _callbacks(update, context):
             await query.edit_message_text(
                 "Refund requests are reviewed by clinic reception. Eligibility depends on the "
                 "clinic's refund policy and the payment status. Use Help & Contact Reception to request a review."
+            )
+        return
+
+    if data.startswith("req-cancel:"):
+        request_id = data.removeprefix("req-cancel:")
+        row = context.user_data.get("booking_requests", {}).get(request_id)
+        if not row:
+            await query.edit_message_text("That pending request is no longer available.")
+            return
+        await query.edit_message_text(
+            f"Cancel pending request {request_id[:8]}? This cannot be undone.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Yes, cancel request", callback_data=f"req-cancel-confirm:{request_id}")],
+                [InlineKeyboardButton("Back to appointments", callback_data="my-appointments")],
+            ]),
+        )
+        return
+
+    if data.startswith("req-cancel-confirm:"):
+        request_id = data.removeprefix("req-cancel-confirm:")
+        row = context.user_data.get("booking_requests", {}).get(request_id)
+        if not row:
+            await query.edit_message_text("That pending request is no longer available.")
+            return
+        try:
+            await asyncio.to_thread(
+                lambda: _client().rpc("transition_booking_request", {
+                    "p_booking_request_id": request_id,
+                    "p_expected_status": row["status"],
+                    "p_target_status": "cancelled",
+                }).execute()
+            )
+            await query.edit_message_text(f"Pending request {request_id[:8]} cancelled.")
+        except Exception:
+            logger.exception("Pending booking request cancellation failed")
+            await query.edit_message_text(
+                "The pending request could not be cancelled. Please contact reception."
+            )
+        return
+
+    if data.startswith("req-retry:"):
+        request_id = data.removeprefix("req-retry:")
+        row = context.user_data.get("booking_requests", {}).get(request_id)
+        if not row:
+            await query.edit_message_text("That pending request is no longer available.")
+            return
+        try:
+            result = await asyncio.to_thread(
+                finalize_booking_request, _clinic_id(), request_id
+            )
+        except Exception:
+            logger.exception("Pending booking request confirmation retry failed")
+            await query.edit_message_text(
+                "Confirmation is still blocked by the clinic's payment check. "
+                "Please contact reception."
+            )
+            return
+        if result.get("status") == "confirmed":
+            appointment = result.get("appointment") or {}
+            await query.edit_message_text(
+                "Appointment confirmed.\n"
+                f"Reference: {appointment.get('appointment_reference') or '—'}"
+            )
+        else:
+            await query.edit_message_text(
+                result.get("reason") or "The request is not ready to confirm yet."
             )
         return
 
@@ -1486,6 +1566,41 @@ def _load_patient_appointments(patient_ids: list[str]) -> list[dict]:
     ).limit(50).execute().data or []
 
 
+def _load_patient_booking_requests(patient_ids: list[str]) -> list[dict]:
+    return _client().table("booking_requests").select(
+        "id,status,preferred_dentist_id,preferred_window_start,preferred_window_end,"
+        "total_amount,currency,payment_mode,payment_status,service_id,created_at,"
+        "booking_request_services(service_name,start_at,end_at),dentists(name)"
+    ).eq("clinic_id", _clinic_id()).in_("patient_id", patient_ids).in_(
+        "status",
+        [
+            "awaiting_patient_info",
+            "awaiting_payment",
+            "payment_submitted",
+            "payment_rejected",
+            "payment_verified",
+            "awaiting_slot_selection",
+        ],
+    ).order("created_at", desc=True).limit(20).execute().data or []
+
+
+def _request_detail_lines(row: dict, timezone_name: str) -> list[str]:
+    services = row.get("booking_request_services") or []
+    names = ", ".join(
+        line.get("service_name") for line in services if line.get("service_name")
+    ) or "Appointment"
+    doctor = (row.get("dentists") or {}).get("name") or "doctor pending"
+    when = _when_text(row.get("preferred_window_start"), timezone_name)
+    return [
+        f"📝 Pending request {row['id'][:8]} · {row['status'].replace('_', ' ')}",
+        f"   Doctor: {doctor}",
+        f"   Services: {names}",
+        f"   When: {when}",
+        f"   Bill: {_money(row.get('total_amount'), row.get('currency') or 'AED')}",
+        f"   Payment: {row.get('payment_mode') or 'not selected'} · {row.get('payment_status') or 'unpaid'}",
+    ]
+
+
 def _appointment_state(rows: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
     now = datetime.now(timezone.utc)
     upcoming, past, cancelled = [], [], []
@@ -1511,19 +1626,25 @@ async def _my_appointments(update, patients: list[dict], context):
     try:
         clinic = await asyncio.to_thread(get_active_clinic, _clinic_id())
         rows = await asyncio.to_thread(_load_patient_appointments, patient_ids)
+        requests = await asyncio.to_thread(_load_patient_booking_requests, patient_ids)
     except Exception:
         logger.exception("Telegram appointment dashboard load failed")
         await message.reply_text("Appointments are temporarily unavailable.")
         return
 
     context.user_data["appointments"] = {row["id"]: row for row in rows}
+    context.user_data["booking_requests"] = {row["id"]: row for row in requests}
     context.user_data["lookup_patients"] = patients
     upcoming, past, cancelled = _appointment_state(rows)
 
     lines = [f"👤 {_patient_profile(row)}" for row in patients]
-    if not rows:
+    if not rows and not requests:
         lines += ["", "No appointments found."]
     else:
+        if requests:
+            lines += ["", "Pending booking requests:"]
+            for row in requests:
+                lines += _request_detail_lines(row, clinic.timezone)
         for title, group in (
             ("Upcoming appointments", upcoming),
             ("Past appointments", past),
@@ -1536,6 +1657,12 @@ async def _my_appointments(update, patients: list[dict], context):
                 lines += _appointment_detail_lines(row, clinic.timezone)
 
     buttons = []
+    for row in requests[:4]:
+        short = row["id"][:8]
+        buttons.append([
+            InlineKeyboardButton(f"Retry {short}", callback_data=f"req-retry:{row['id']}"),
+            InlineKeyboardButton(f"Cancel request {short}", callback_data=f"req-cancel:{row['id']}"),
+        ])
     for row in upcoming[:4]:
         reference = row.get("appointment_reference") or row["id"][:8]
         buttons.append([
