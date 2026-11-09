@@ -13,6 +13,7 @@ from supabase import Client
 from app.core.config import get_settings
 from app.database.supabase import get_supabase_client
 from app.integrations.google_calendar import GoogleCalendarClient
+from app.operations import appointment_notifications
 from app.repositories.clinics import get_active_clinic
 
 
@@ -455,57 +456,6 @@ def _apply_service_schedule(
         ).execute()
 
 
-def _schedule_reminder(
-    supabase: Client,
-    *,
-    request: dict,
-    appointment: dict,
-    dentist_name: str,
-    services: list[dict],
-    clinic_name: str,
-    timezone_name: str,
-) -> None:
-    start_at = _parse_timestamp(
-        request.get("preferred_window_start") or appointment.get("start_at")
-    )
-    if start_at is None:
-        return
-    scheduled_at = start_at - timedelta(hours=24)
-    now = _utc_now()
-    if scheduled_at <= now:
-        scheduled_at = now + timedelta(minutes=1)
-
-    payload = {
-        "clinic_id": request["clinic_id"],
-        "contact_id": request["contact_id"],
-        "booking_request_id": request["id"],
-        "appointment_id": appointment["id"],
-        "notification_type": "appointment_reminder",
-        "channel": "telegram",
-        "reminder_number": 1,
-        "scheduled_at": scheduled_at.isoformat(),
-        "event_key": f"appointment_reminder:{appointment['id']}",
-        "template_data": {
-            "appointment_reference": appointment.get("appointment_reference"),
-            "start_at": start_at.isoformat(),
-            "end_at": request.get("preferred_window_end"),
-            "clinic_name": clinic_name,
-            "timezone": timezone_name,
-            "dentist_name": dentist_name,
-            "services": ", ".join(
-                line["service_name"] for line in services
-            ),
-            "payment_mode": request.get("payment_mode"),
-            "payment_status": request.get("payment_status"),
-        },
-    }
-    try:
-        supabase.table("outbound_notifications").insert(payload).execute()
-    except APIError as exc:
-        if exc.code != "23505":
-            raise
-
-
 def finalize_booking_request(
     clinic_id: str,
     booking_request_id: str,
@@ -704,15 +654,40 @@ def finalize_booking_request(
         request["payment_status"] = "paid"
         appointment["payment_status"] = "paid"
 
-    _schedule_reminder(
+    template = {
+        "appointment_reference": appointment.get("appointment_reference"),
+        "start_at": request.get("preferred_window_start"),
+        "end_at": request.get("preferred_window_end"),
+        "clinic_name": clinic.name,
+        "timezone": clinic.timezone,
+        "dentist_name": dentist_name,
+        "services": ", ".join(line["service_name"] for line in services),
+        "payment_mode": request.get("payment_mode"),
+        "payment_status": request.get("payment_status"),
+    }
+    appointment_notifications.record_immediate_notification(
         supabase,
-        request=request,
-        appointment=appointment,
-        dentist_name=dentist_name,
-        services=services,
-        clinic_name=clinic.name,
-        timezone_name=clinic.timezone,
+        clinic_id=clinic_id,
+        contact_id=request.get("contact_id"),
+        booking_request_id=request["id"],
+        appointment_id=appointment["id"],
+        notification_type="booking_confirmation",
+        template_data=template,
+        event_key=f"booking_confirmation:{appointment['id']}",
     )
+    start_at = _parse_timestamp(
+        request.get("preferred_window_start") or appointment.get("start_at")
+    )
+    if start_at is not None:
+        appointment_notifications.schedule_appointment_reminders(
+            supabase,
+            clinic_id=clinic_id,
+            contact_id=request.get("contact_id"),
+            booking_request_id=request["id"],
+            appointment_id=appointment["id"],
+            start_at=start_at,
+            template_data=template,
+        )
 
     return {
         "status": "confirmed",
