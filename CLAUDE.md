@@ -70,8 +70,8 @@ There is no Supabase CLI configuration in the repo. Migrations are applied **man
   - **Typed pipeline**: `booking.py`, `reschedule.py`, `cancellation.py`, `availability.py`, `slot_finder.py`. Used by scripts and the operational tools. It validates schedules, DB conflicts, and Calendar, then creates `pending -> confirmed` appointments.
   - **Telegram request pipeline**: `patient_booking.py` + `app/telegram/bot.py`. Creates `booking_requests`, then `reserve_appointment` / `confirm_appointment_reservation` RPCs. This is the live patient flow and supports multi-service bookings with per-service doctor/time rows in `booking_request_services` and `appointment_services`.
 - `app/telegram/bot.py` — the patient state machine. Persistent menu: Book Appointment, My Appointments, Our Doctors, Dental Services, Ask Marina AI, Payments & Pricing, Help & Contact Reception.
-  - `Book Appointment`: phone/email -> (register: name, age, gender) -> multi-service selection -> doctor eligible for all services -> one date/slot per service -> total bill -> cash/online -> edit warning -> confirm.
-  - `My Appointments`, payment history, and payment status: ask only for the booking phone/email, then show the patient's name, age, gender and grouped upcoming/past/cancelled appointments.
+  - `Book Appointment`: phone/email -> multi-service selection -> doctor eligible for all services -> live available slots from schedules/appointments/Calendar (no manual date entry) -> slot selection -> name/age/gender for new or incomplete patients -> cash-only confirmation with reference, patient ID, age, gender, doctor, services, and time.
+  - `My Appointments`, payment history, and payment status: ask only for the booking phone/email, then show the patient's name, age, gender and grouped upcoming/past/cancelled appointments. Reschedule also lists live slots immediately.
   - Appointment actions: view details, reschedule (wired to `reschedule_appointment` with multi-service duration/service overrides), cancel appointment, cancel linked booking plan.
   - `Our Doctors`, `Dental Services`, `Ask Marina AI`, `Payments & Pricing` (prices, methods, history, payment status, refund guidance), `Help & Contact Reception`.
   - `Main menu` is intentionally absent from the persistent keyboard; a `🏠 Main menu` inline button exists only inside the booking flow.
@@ -114,7 +114,7 @@ Never expose `SUPABASE_SECRET_KEY`, Gemini keys, Google private keys, or `DEMO_A
 
 ## Verification expectations
 
-- Python suite: 234 tests.
+- Python suite: 236 tests.
 - Dashboard suite: 27 tests across 10 files.
 - TypeScript must pass `npm run typecheck`.
 - Tests do not prove live Supabase constraints, Calendar permissions, migrations, Telegram polling, or Render/Vercel deploys. Verify those separately against the hosted services.
