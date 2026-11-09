@@ -314,8 +314,8 @@ def describe_active_booking(booking: dict) -> str:
     when_text = when[:16].replace("T", " ") if when else "a scheduled time"
     return (
         f"You already have an unserved booking ({when_text}).\n"
-        "You cannot edit the selected services in an existing booking. "
-        "Review the services before confirming a new booking, or cancel the existing booking first."
+        "You cannot edit the selected services in an existing booking.\n"
+        "Open My Appointments to retry confirmation or cancel the existing booking, then book again."
     )
 
 
