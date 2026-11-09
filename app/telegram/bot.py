@@ -7,6 +7,7 @@ import re
 import unicodedata
 from contextlib import suppress
 from datetime import date, datetime, time, timedelta, timezone
+from time import monotonic
 from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -21,6 +22,7 @@ from app.database.supabase import get_supabase_client
 from app.operations.appointment_change_models import AppointmentActor, AppointmentActorType
 from app.operations.cancellation import cancel_appointment
 from app.operations import appointment_notifications
+from app.operations.patient_handoff import create_reception_handoff
 from app.operations.patient_booking import (
     PatientBookingError,
     active_booking_for_patient,
@@ -54,6 +56,53 @@ IDENTIFIER_PROMPT = (
     "Enter the phone number you used to book, in international format "
     "(e.g. +92 311-8917906) or local format (e.g. 03118917906), or your email address."
 )
+
+EMERGENCY_TERMS = (
+    "difficulty breathing",
+    "can't breathe",
+    "cannot breathe",
+    "difficulty swallowing",
+    "can't swallow",
+    "cannot swallow",
+    "severe facial swelling",
+    "uncontrolled bleeding",
+    "bleeding won't stop",
+    "heavy bleeding",
+)
+
+EMERGENCY_REPLY = (
+    "⚠️ This may be a medical emergency.\n\n"
+    "Difficulty breathing, difficulty swallowing, severe facial swelling, or "
+    "uncontrolled bleeding needs immediate professional care.\n\n"
+    "Please call your local emergency number or go to the nearest emergency "
+    "department now. Do not wait for a routine appointment."
+)
+
+RATE_LIMIT_WINDOW_SECONDS = 60
+RATE_LIMIT_MAX_MESSAGES = 30
+_rate_buckets: dict[int, list[float]] = {}
+
+
+def _is_emergency(text: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    return any(term in normalized for term in EMERGENCY_TERMS)
+
+
+def _rate_limited(chat_id: int | None) -> bool:
+    if chat_id is None:
+        return False
+    now = monotonic()
+    bucket = [
+        stamp
+        for stamp in _rate_buckets.get(chat_id, [])
+        if now - stamp < RATE_LIMIT_WINDOW_SECONDS
+    ]
+    if len(bucket) >= RATE_LIMIT_MAX_MESSAGES:
+        _rate_buckets[chat_id] = bucket
+        return True
+    bucket.append(now)
+    _rate_buckets[chat_id] = bucket
+    return False
 
 
 def _menu():
@@ -176,6 +225,8 @@ def _clear_flow(context):
         "lookup_patients",
         "appointments",
         "reschedule_target",
+        "reschedule_choice",
+        "confirm_lock",
         "slots",
         "request_id",
         "cancel_status",
@@ -245,6 +296,7 @@ async def _continue_booking_identifier(update, context):
             if contact.get("telegram_chat_id") not in (None, chat_id)
         ]
         if other_contacts and not linked_contacts:
+            logger.warning("Booking identity rejected for unlinked Telegram chat")
             _clear_flow(context)
             await update.effective_message.reply_text(
                 "This phone or email is linked to another Telegram account. "
@@ -318,6 +370,10 @@ async def _start_service_selection(update, context, patient, reply_message=None)
             await message.reply_text("I couldn't verify your bookings. Please try again.")
             return
         if existing:
+            logger.info(
+                "Duplicate active booking blocked",
+                extra={"patient_id": patient["patient_id"]},
+            )
             _clear_flow(context)
             context.user_data["lookup_patients"] = [patient]
             await message.reply_text(
@@ -389,7 +445,62 @@ async def _ask_profile(message, context):
         )
     else:
         context.user_data.pop(STATE, None)
-        await _confirm_selected_booking(message, context)
+        await _show_booking_review(message, context)
+
+
+async def _show_booking_review(message, context):
+    booking = context.user_data.get("booking") or {}
+    patient = context.user_data.get("booking_patient")
+    profile = context.user_data.get("slot_profile") or {}
+    services, total, _duration = _selected_summary(booking)
+    slot = booking.get("slot") or {}
+    if not services or not slot or not booking.get("dentist_id"):
+        _clear_flow(context)
+        await message.reply_text(
+            "Your booking details expired. Please start again.", reply_markup=_menu()
+        )
+        return
+
+    clinic = await asyncio.to_thread(get_active_clinic, _clinic_id())
+    name = patient.get("name") if patient else profile.get("name")
+    age = (
+        patient.get("age_at_registration")
+        if patient and patient.get("age_at_registration") is not None
+        else profile.get("age")
+    )
+    gender = (patient or {}).get("gender") or profile.get("gender")
+    patient_number = patient.get("patient_number") if patient else None
+    doctor = (booking.get("dentists") or {}).get(booking.get("dentist_id")) or "—"
+    service_lines = _booking_services_with_times(booking)
+    schedule = "\n".join(
+        f"   • {line['name']} · {_when_text(line.get('start_at'), clinic.timezone)}"
+        for line in service_lines
+    )
+
+    text = "\n".join([
+        "Please review your booking before confirming:",
+        "",
+        f"Patient: {name or '—'}",
+        f"Patient ID: {patient_number or 'created after confirmation'}",
+        f"Age: {age if age is not None else '—'}",
+        f"Gender: {gender or '—'}",
+        f"Doctor: {doctor}",
+        f"When: {_when_text(slot.get('start_at'), clinic.timezone)}",
+        "Services:",
+        schedule,
+        f"Total bill: {_money(total, booking.get('currency') or 'AED')}",
+        "Payment: cash in hand · unpaid",
+        "",
+        "Tap Confirm booking to save this appointment.",
+    ])
+    await message.reply_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Confirm booking", callback_data="confirm-booking")],
+            [InlineKeyboardButton("Cancel booking", callback_data="cancel-booking")],
+            _main_menu_row(),
+        ]),
+    )
 
 
 async def _verify_slot_profile_name(update, context):
@@ -661,6 +772,7 @@ async def _verify_lookup_identifier(update, context):
         if contact.get("telegram_chat_id") == chat_id
     ]
     if not linked_contacts:
+        logger.warning("Patient lookup rejected for unlinked Telegram chat")
         await update.effective_message.reply_text(
             "This phone/email is not linked to this Telegram account. "
             "Please book once from this chat or contact reception.",
@@ -687,6 +799,8 @@ async def _verify_lookup_identifier(update, context):
             await update.effective_message.reply_text(
                 "Appointments are temporarily unavailable. Please try again."
             )
+    elif target == "handoff":
+        await _create_handoff(update, patients)
 
 
 async def _begin_booking(update, context):
@@ -822,6 +936,10 @@ async def _callbacks(update, context):
     if not await _private(update):
         return
     query = update.callback_query
+    if _rate_limited(update.effective_chat.id if update.effective_chat else None):
+        logger.warning("Telegram callback rate limit exceeded")
+        await query.answer("Too many requests. Please wait a moment.", show_alert=True)
+        return
     await query.answer()
     data = query.data or ""
 
@@ -944,6 +1062,10 @@ async def _callbacks(update, context):
             )
         return
 
+    if data == "help:request":
+        await _begin_lookup(query, context, "handoff")
+        return
+
     if data == "my-appointments":
         patients = context.user_data.get("lookup_patients") or []
         try:
@@ -1064,80 +1186,52 @@ async def _callbacks(update, context):
         try:
             slot = context.user_data["slots"][int(data.removeprefix("resched-slot:"))]
         except (KeyError, TypeError, ValueError, IndexError):
-            await query.edit_message_text("That time choice expired. Please start the reschedule again.")
+            await query.edit_message_text(
+                "That time choice expired. Please start the reschedule again."
+            )
             return
         if not target:
             await query.edit_message_text("Please choose an appointment to reschedule.")
             return
+        context.user_data["reschedule_choice"] = slot
+        clinic = await asyncio.to_thread(get_active_clinic, target["clinic_id"])
+        text = "\n".join([
+            "Confirm reschedule:",
+            "",
+            f"Appointment: {target['reference']}",
+            f"New time: {_when_text(slot.start_at.isoformat(), clinic.timezone)}",
+            f"Doctor: {target.get('dentist_name') or '—'}",
+            f"Services: {target.get('service_names')}",
+            f"Duration: {target['duration_minutes']} minutes",
+            "",
+            "Your original appointment stays in place until you confirm.",
+        ])
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Confirm reschedule", callback_data="confirm-reschedule")],
+                [InlineKeyboardButton("Cancel", callback_data="cancel-reschedule")],
+                _main_menu_row(),
+            ]),
+        )
+        return
+
+    if data == "cancel-reschedule":
+        _clear_flow(context)
+        await query.edit_message_text(
+            "Reschedule cancelled. Your original appointment is unchanged."
+        )
+        return
+
+    if data == "confirm-reschedule":
+        if context.user_data.get("confirm_lock"):
+            await query.answer("Your confirmation is already being processed.")
+            return
+        context.user_data["confirm_lock"] = True
         try:
-            result = await asyncio.to_thread(
-                reschedule_appointment,
-                target["clinic_id"],
-                target["contact_id"],
-                target["appointment_id"],
-                slot.start_at,
-                actor=AppointmentActor(
-                    actor_type=AppointmentActorType.PATIENT,
-                    actor_id=target["patient_id"],
-                ),
-                new_dentist_id=target["dentist_id"],
-                duration_minutes_override=target["duration_minutes"],
-                required_service_ids=target["service_ids"],
-                service_name_override=target["service_names"],
-            )
-            if result.status.value == "RESCHEDULED":
-                old_start = _parse_ts(target.get("old_start_at"))
-                stored_row = (context.user_data.get("appointments") or {}).get(target["appointment_id"])
-                if old_start and stored_row:
-                    await asyncio.to_thread(
-                        _shift_appointment_service_times,
-                        stored_row,
-                        slot.start_at - old_start,
-                    )
-                clinic = await asyncio.to_thread(get_active_clinic, target["clinic_id"])
-                template = {
-                    "appointment_reference": target["reference"],
-                    "start_at": slot.start_at.isoformat(),
-                    "clinic_name": clinic.name,
-                    "timezone": clinic.timezone,
-                    "dentist_name": target.get("dentist_name"),
-                    "services": target.get("service_names"),
-                }
-                try:
-                    await asyncio.to_thread(
-                        appointment_notifications.record_immediate_notification,
-                        _client(),
-                        clinic_id=target["clinic_id"],
-                        contact_id=target["contact_id"],
-                        booking_request_id=target.get("booking_request_id"),
-                        appointment_id=target["appointment_id"],
-                        notification_type="reschedule_confirmation",
-                        template_data=template,
-                        event_key=(
-                            f"reschedule_confirmation:{target['appointment_id']}:"
-                            f"{slot.start_at.isoformat()}"
-                        ),
-                    )
-                except Exception:
-                    logger.exception(
-                        "Reschedule notification scheduling failed",
-                        extra={"appointment_id": target["appointment_id"]},
-                    )
-                await query.edit_message_text(
-                    f"{target['reference']} rescheduled to "
-                    f"{_when_text(slot.start_at.isoformat(), clinic.timezone)}."
-                )
-            else:
-                await query.edit_message_text(
-                    result.reason or "The appointment could not be rescheduled."
-                )
-        except Exception:
-            logger.exception("Telegram appointment reschedule failed")
-            await query.edit_message_text("The appointment could not be rescheduled right now.")
+            await _perform_reschedule(query, context)
         finally:
-            context.user_data.pop("reschedule_target", None)
-            context.user_data.pop("slots", None)
-            context.user_data.pop(STATE, None)
+            context.user_data.pop("confirm_lock", None)
         return
 
     if data.startswith("cancel-request:"):
@@ -1245,6 +1339,22 @@ async def _callbacks(update, context):
             return
         await query.edit_message_text(f"Gender: {gender}.")
         await _set_slot_profile_gender(query.message, context, gender)
+        return
+
+    if data == "confirm-booking":
+        if context.user_data.get("confirm_lock"):
+            await query.answer("Your confirmation is already being processed.")
+            return
+        context.user_data["confirm_lock"] = True
+        try:
+            await _confirm_selected_booking(query.message, context)
+        finally:
+            context.user_data.pop("confirm_lock", None)
+        return
+
+    if data == "cancel-booking":
+        _clear_flow(context)
+        await query.edit_message_text("Booking cancelled. No appointment was created.")
         return
 
     if data.startswith("toggle:"):
@@ -1450,6 +1560,90 @@ async def _show_booking_slots(update_or_query, context):
         f"Available times with {doctor_name} (live availability):",
         reply_markup=InlineKeyboardMarkup(rows),
     )
+
+
+async def _perform_reschedule(query, context):
+    target = context.user_data.get("reschedule_target")
+    slot = context.user_data.get("reschedule_choice")
+    if not target or slot is None:
+        await query.edit_message_text(
+            "Reschedule details expired. Please start again."
+        )
+        return
+    try:
+        result = await asyncio.to_thread(
+            reschedule_appointment,
+            target["clinic_id"],
+            target["contact_id"],
+            target["appointment_id"],
+            slot.start_at,
+            actor=AppointmentActor(
+                actor_type=AppointmentActorType.PATIENT,
+                actor_id=target["patient_id"],
+            ),
+            new_dentist_id=target["dentist_id"],
+            duration_minutes_override=target["duration_minutes"],
+            required_service_ids=target["service_ids"],
+            service_name_override=target["service_names"],
+        )
+        if result.status.value == "RESCHEDULED":
+            old_start = _parse_ts(target.get("old_start_at"))
+            stored_row = (context.user_data.get("appointments") or {}).get(
+                target["appointment_id"]
+            )
+            if old_start and stored_row:
+                await asyncio.to_thread(
+                    _shift_appointment_service_times,
+                    stored_row,
+                    slot.start_at - old_start,
+                )
+            clinic = await asyncio.to_thread(get_active_clinic, target["clinic_id"])
+            template = {
+                "appointment_reference": target["reference"],
+                "start_at": slot.start_at.isoformat(),
+                "clinic_name": clinic.name,
+                "timezone": clinic.timezone,
+                "dentist_name": target.get("dentist_name"),
+                "services": target.get("service_names"),
+            }
+            try:
+                await asyncio.to_thread(
+                    appointment_notifications.record_immediate_notification,
+                    _client(),
+                    clinic_id=target["clinic_id"],
+                    contact_id=target["contact_id"],
+                    booking_request_id=target.get("booking_request_id"),
+                    appointment_id=target["appointment_id"],
+                    notification_type="reschedule_confirmation",
+                    template_data=template,
+                    event_key=(
+                        f"reschedule_confirmation:{target['appointment_id']}:"
+                        f"{slot.start_at.isoformat()}"
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    "Reschedule notification scheduling failed",
+                    extra={"appointment_id": target["appointment_id"]},
+                )
+            await query.edit_message_text(
+                f"{target['reference']} rescheduled to "
+                f"{_when_text(slot.start_at.isoformat(), clinic.timezone)}."
+            )
+        else:
+            await query.edit_message_text(
+                result.reason or "The appointment could not be rescheduled."
+            )
+    except Exception:
+        logger.exception("Telegram appointment reschedule failed")
+        await query.edit_message_text(
+            "The appointment could not be rescheduled right now."
+        )
+    finally:
+        context.user_data.pop("reschedule_target", None)
+        context.user_data.pop("reschedule_choice", None)
+        context.user_data.pop("slots", None)
+        context.user_data.pop(STATE, None)
 
 
 async def _submit_receipt(update, context):
@@ -1710,10 +1904,48 @@ async def _help(update):
         f"Address: {clinic.get('address') or 'Please ask reception'}",
         f"Emergency phone: {clinic.get('emergency_phone') or 'Please ask reception'}",
         "",
-        "For booking changes, payments, refunds, or a human follow-up, reply here and reception will assist.",
+        "For booking changes, payments, refunds, or a human follow-up, tap the button below.",
         "Your request will be reviewed by clinic staff.",
     ]
-    await update.effective_message.reply_text("\n".join(lines), reply_markup=_menu())
+    await update.effective_message.reply_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "Request reception callback",
+                callback_data="help:request",
+            )
+        ]]),
+    )
+
+
+async def _create_handoff(update, patients: list[dict]) -> None:
+    if not patients:
+        await update.effective_message.reply_text(
+            "No patient record is linked to this phone/email. Please contact reception directly.",
+            reply_markup=_menu(),
+        )
+        return
+    contact_id = patients[0]["primary_contact_id"]
+    try:
+        await asyncio.to_thread(
+            create_reception_handoff,
+            _clinic_id(),
+            contact_id,
+            "Patient requested a reception callback from the Telegram Help menu.",
+        )
+        logger.info("Reception handoff created", extra={"contact_id": contact_id})
+        await update.effective_message.reply_text(
+            "Reception has been notified and will follow up. "
+            "Your appointment records are unchanged.",
+            reply_markup=_menu(),
+        )
+    except Exception:
+        logger.exception("Reception handoff creation failed")
+        await update.effective_message.reply_text(
+            "I couldn't notify reception right now. Please call the clinic phone shown "
+            "under Help & Contact Reception.",
+            reply_markup=_menu(),
+        )
 
 
 def _appointment_service_rows(row: dict) -> list[dict]:
@@ -2127,7 +2359,10 @@ def _shift_appointment_service_times(row: dict, delta: timedelta) -> None:
 async def _ask_ai(update, question):
     try:
         result = await asyncio.to_thread(answer_knowledge_question, _clinic_id(), question)
-        source = "Clinic information" if result.grounding in {"rag", "supabase"} else "Please confirm with reception"
+        grounded = result.grounding in {"rag", "supabase"}
+        if not grounded:
+            logger.info("AI answer required reception confirmation")
+        source = "Clinic information" if grounded else "Please confirm with reception"
         await update.effective_message.reply_text(f"{result.text}\n\n{source}", reply_markup=_menu())
     except Exception:
         logger.exception("MarinaSmileAI query failed")
@@ -2139,6 +2374,10 @@ async def _text(update, context):
         return
     msg = update.effective_message
     if not msg or not msg.text:
+        return
+    if _rate_limited(update.effective_chat.id if update.effective_chat else None):
+        logger.warning("Telegram rate limit exceeded")
+        await msg.reply_text("You're sending messages too quickly. Please wait a moment.")
         return
     state, text = context.user_data.get(STATE), msg.text.strip()
     if text in {item for row in MENU for item in row}:
@@ -2161,6 +2400,10 @@ async def _text(update, context):
     if text.casefold() in {"main menu", "menu", "home"}:
         _clear_flow(context)
         await msg.reply_text("Main menu", reply_markup=_menu())
+        return
+    if _is_emergency(text):
+        logger.warning("Emergency symptoms detected in Telegram message")
+        await msg.reply_text(EMERGENCY_REPLY, reply_markup=_menu())
         return
     if state == "booking_identifier":
         await _verify_booking_identifier(update, context)

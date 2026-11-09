@@ -117,10 +117,25 @@ Never expose `SUPABASE_SECRET_KEY`, Gemini keys, Google private keys, or `DEMO_A
 
 ## Verification expectations
 
-- Python suite: 244 tests.
+- Python suite: 246 tests.
 - Dashboard suite: 27 tests across 10 files.
 - TypeScript must pass `npm run typecheck`.
 - Tests do not prove live Supabase constraints, Calendar permissions, migrations, Telegram polling, or Render/Vercel deploys. Verify those separately against the hosted services.
+
+## Guardrails and enforcement
+
+Do not weaken these when changing workflows:
+
+- **AI:** `app/ai/prompts.py` limits answers to Marina Smile, forbids inventing operational facts, diagnoses, prescriptions, dosages, outcome guarantees, credential/system-prompt disclosure, prompt injection, and false booking/payment claims. Gemini has no tool or SQL/shell execution.
+- **Medical:** `_is_emergency()` in `app/telegram/bot.py` intercepts difficulty breathing, difficulty swallowing, severe facial swelling, and uncontrolled bleeding before AI or booking and advises immediate emergency care.
+- **Identity/privacy:** patient lookups require the Telegram chat linked to the contact. `PatientSafeSupabase` blocks staff, payroll, refund, and audit tables. Cancellation anonymises identifiers and deletes receipt images. Do not log patient names, phones, or emails.
+- **Appointments:** booking shows a full summary and requires an explicit **Confirm booking** callback; rescheduling shows a summary and requires **Confirm reschedule**. Database exclusion constraints, `reserve_appointment`, and Calendar checks are authoritative. Never auto-cancel for a missed reminder.
+- **Payments:** screenshots stay `submitted` until staff verification. Cash settlement, approval, rejection, and refunds are staff-only RPCs. AI never modifies payments.
+- **Notifications:** database triggers own reminder scheduling, moving, and cancellation. The worker re-checks appointment status before sending, uses unique event keys, and retries delivery up to 3 times with a 5-minute delay. Delivery failure never changes an appointment. Reminder previews omit treatment names; full details stay in My Appointments. Messages are transactional, not marketing.
+- **Security/reliability:** per-chat rate limiting for messages and callbacks; Google Calendar timeouts; booking compensation; FastAPI/Pydantic input validation; HTTPS in hosted environments; structured logs for failed bookings, duplicate attempts, rejected lookups, notification failures, and AI fallbacks. The bot uses polling, not a webhook, so there is no webhook endpoint to validate.
+- **Human handoff:** `Help & Contact Reception` can create a staff handoff via `app/operations/patient_handoff.py`.
+
+Relevant regression tests: `tests/test_telegram_guardrails.py`, `tests/test_notifications.py`, `tests/test_telegram_appointments.py`, `tests/test_booking_concurrency.py`, `tests/test_cancellation.py`, `tests/test_reschedule.py`.
 
 ## Known gaps (verified, not implemented)
 
