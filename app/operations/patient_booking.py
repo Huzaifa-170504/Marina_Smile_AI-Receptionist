@@ -675,20 +675,6 @@ def finalize_booking_request(
         template_data=template,
         event_key=f"booking_confirmation:{appointment['id']}",
     )
-    start_at = _parse_timestamp(
-        request.get("preferred_window_start") or appointment.get("start_at")
-    )
-    if start_at is not None:
-        appointment_notifications.schedule_appointment_reminders(
-            supabase,
-            clinic_id=clinic_id,
-            contact_id=request.get("contact_id"),
-            booking_request_id=request["id"],
-            appointment_id=appointment["id"],
-            start_at=start_at,
-            template_data=template,
-        )
-
     return {
         "status": "confirmed",
         "appointment": appointment,

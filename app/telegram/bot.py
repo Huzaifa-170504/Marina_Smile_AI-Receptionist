@@ -1118,16 +1118,6 @@ async def _callbacks(update, context):
                             f"{slot.start_at.isoformat()}"
                         ),
                     )
-                    await asyncio.to_thread(
-                        appointment_notifications.schedule_appointment_reminders,
-                        _client(),
-                        clinic_id=target["clinic_id"],
-                        contact_id=target["contact_id"],
-                        booking_request_id=target.get("booking_request_id"),
-                        appointment_id=target["appointment_id"],
-                        start_at=slot.start_at,
-                        template_data=template,
-                    )
                 except Exception:
                     logger.exception(
                         "Reschedule notification scheduling failed",
