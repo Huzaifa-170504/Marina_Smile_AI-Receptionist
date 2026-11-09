@@ -1,4 +1,6 @@
-from app.telegram.notifications import _format_notification, _format_when
+from datetime import datetime, timezone
+
+from app.telegram.notifications import _format_notification, _format_when, _time_until
 
 
 def _appointment() -> dict:
@@ -60,3 +62,11 @@ def test_format_when_uses_clinic_timezone() -> None:
     formatted = _format_when("2026-11-10T10:00:00+00:00", "Asia/Dubai")
     assert "10 Nov 2026" in formatted
     assert "02:00 PM" in formatted
+
+
+def test_time_until_uses_actual_duration() -> None:
+    now = datetime(2026, 11, 10, 8, 0, tzinfo=timezone.utc)
+    assert _time_until("2026-11-10T10:00:00+00:00", now=now) == "in about 2 hours"
+    assert _time_until("2026-11-10T08:30:00+00:00", now=now) == "in about 30 minutes"
+    assert _time_until("2026-11-12T08:00:00+00:00", now=now) == "in about 2.0 days"
+    assert _time_until("2026-11-10T07:00:00+00:00", now=now) == "now"
