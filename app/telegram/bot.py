@@ -35,6 +35,7 @@ from app.operations.slot_finder import find_available_slots
 from app.repositories.clinics import get_active_clinic
 from app.repositories.dentists import filter_dentists_for_service, list_active_dentists
 from app.telegram.notifications import run_notification_worker
+from app.telegram.privacy import PatientSafeSupabase
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -70,7 +71,7 @@ def _appointments_shortcut():
 
 
 def _client():
-    return get_supabase_client()
+    return PatientSafeSupabase(get_supabase_client())
 
 
 def _clinic_id():
@@ -231,6 +232,31 @@ async def _continue_booking_identifier(update, context):
         return
 
     patients = [row for row in info.get("patients", []) if row.get("active", True)]
+    chat_id = context.user_data.get("booking_chat_id")
+    contacts = info.get("contacts", [])
+    if contacts and chat_id is not None:
+        linked_contacts = [
+            contact for contact in contacts
+            if contact.get("telegram_chat_id") == chat_id
+        ]
+        other_contacts = [
+            contact for contact in contacts
+            if contact.get("telegram_chat_id") not in (None, chat_id)
+        ]
+        if other_contacts and not linked_contacts:
+            _clear_flow(context)
+            await update.effective_message.reply_text(
+                "This phone or email is linked to another Telegram account. "
+                "Please contact reception.",
+                reply_markup=_menu(),
+            )
+            return
+        if linked_contacts:
+            linked_ids = {contact["id"] for contact in linked_contacts}
+            patients = [
+                row for row in patients
+                if row["primary_contact_id"] in linked_ids
+            ]
     if len(patients) > 1:
         context.user_data["booking_patients"] = patients
         context.user_data[STATE] = "booking_name"
@@ -627,7 +653,24 @@ async def _verify_lookup_identifier(update, context):
         )
         await update.effective_message.reply_text(message, reply_markup=_menu())
         return
-    patients = info.get("patients", [])
+
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    linked_contacts = [
+        contact for contact in info["contacts"]
+        if contact.get("telegram_chat_id") == chat_id
+    ]
+    if not linked_contacts:
+        await update.effective_message.reply_text(
+            "This phone/email is not linked to this Telegram account. "
+            "Please book once from this chat or contact reception.",
+            reply_markup=_menu(),
+        )
+        return
+    linked_ids = {contact["id"] for contact in linked_contacts}
+    patients = [
+        row for row in info.get("patients", [])
+        if row["primary_contact_id"] in linked_ids
+    ]
     if target == "status":
         await _status(update, patients)
     elif target == "cancel":
@@ -841,7 +884,16 @@ async def _callbacks(update, context):
                     "p_target_status": "cancelled",
                 }).execute()
             )
-            await query.edit_message_text(f"Pending request {request_id[:8]} cancelled.")
+            try:
+                note = await asyncio.to_thread(
+                    _anonymize_booking_privacy, _client(), request_id
+                )
+            except Exception:
+                logger.exception("Booking privacy cleanup failed after request cancel")
+                note = "Personal details could not be removed. Please contact reception."
+            await query.edit_message_text(
+                f"Pending request {request_id[:8]} cancelled.\n{note}"
+            )
         except Exception:
             logger.exception("Pending booking request cancellation failed")
             await query.edit_message_text(
@@ -934,9 +986,14 @@ async def _callbacks(update, context):
         outcomes = await _cancel_stored_appointments([row])
         ok = bool(outcomes and outcomes[0][1])
         reference = row.get("appointment_reference") or row["id"][:8]
-        await query.edit_message_text(
-            f"{reference} cancelled." if ok else (outcomes[0][2] if outcomes else "The appointment could not be cancelled.")
-        )
+        if ok:
+            note = outcomes[0][2] if outcomes else None
+            text = f"{reference} cancelled."
+            if note:
+                text += f"\n{note}"
+        else:
+            text = outcomes[0][2] if outcomes else "The appointment could not be cancelled."
+        await query.edit_message_text(text)
         return
 
     if data.startswith("plan-cancel:"):
@@ -967,7 +1024,12 @@ async def _callbacks(update, context):
         outcomes = await _cancel_stored_appointments(rows)
         cancelled = sum(1 for _row, ok, _reason in outcomes if ok)
         failures = [reason for _row, ok, reason in outcomes if not ok and reason]
+        privacy_notes = sorted({
+            reason for _row, ok, reason in outcomes if ok and reason
+        })
         text = f"Cancelled {cancelled} of {len(rows)} appointment(s)."
+        if privacy_notes:
+            text += "\n" + "\n".join(privacy_notes)
         if failures:
             text += "\n" + "\n".join(failures)
         await query.edit_message_text(text)
@@ -1046,7 +1108,14 @@ async def _callbacks(update, context):
             await asyncio.to_thread(lambda: _client().rpc("transition_booking_request", {
                 "p_booking_request_id": request_id, "p_expected_status": expected,
                 "p_target_status": "cancelled"}).execute())
-            await query.edit_message_text("Booking request cancelled.")
+            try:
+                note = await asyncio.to_thread(
+                    _anonymize_booking_privacy, _client(), request_id
+                )
+            except Exception:
+                logger.exception("Booking privacy cleanup failed after request cancel")
+                note = "Personal details could not be removed. Please contact reception."
+            await query.edit_message_text(f"Booking request cancelled.\n{note}")
         except Exception:
             logger.exception("Telegram booking request cancellation failed")
             await query.edit_message_text("The request could not be cancelled. Check its current status.")
@@ -1081,9 +1150,25 @@ async def _callbacks(update, context):
                             _client(),
                             stored["booking_request_id"],
                         )
+                        note = await asyncio.to_thread(
+                            _anonymize_booking_privacy,
+                            _client(),
+                            stored["booking_request_id"],
+                        )
                     except Exception:
-                        logger.exception("Booking request cancellation failed after appointment cancel")
-            await query.edit_message_text("Appointment cancelled." if ok else (result.reason or "The appointment could not be cancelled."))
+                        logger.exception("Booking privacy cleanup failed after appointment cancel")
+                        note = "Personal details could not be removed. Please contact reception."
+                else:
+                    note = None
+            else:
+                note = None
+            if ok:
+                text = "Appointment cancelled."
+                if note:
+                    text += f"\n{note}"
+            else:
+                text = result.reason or "The appointment could not be cancelled."
+            await query.edit_message_text(text)
         except Exception:
             logger.exception("Telegram appointment cancellation failed")
             await query.edit_message_text("The appointment could not be cancelled right now.")
@@ -1245,20 +1330,22 @@ async def _show_booking_slots(update_or_query, context):
             result.reason or "The service duration needs to be confirmed by clinic staff."
         )
         return
-    if not result.slots:
+    now_check = datetime.now(timezone)
+    available = [slot for slot in result.slots if slot.start_at > now_check]
+    if not available:
         await message.edit_text(
             f"No available times with {doctor_name} in the next "
             f"{get_settings().availability_search_days} days for a {duration}-minute "
             "appointment. Please contact reception."
         )
         return
-    context.user_data["slots"] = result.slots
+    context.user_data["slots"] = available
     rows = [
         [InlineKeyboardButton(
             slot.start_at.astimezone(timezone).strftime("%a %d %b, %I:%M %p"),
             callback_data=f"bslot:{index}",
         )]
-        for index, slot in enumerate(result.slots)
+        for index, slot in enumerate(available)
     ]
     rows.append(_main_menu_row())
     await message.edit_text(
@@ -1709,9 +1796,27 @@ def _cancel_linked_booking_request(client, booking_request_id: str) -> None:
     ).eq("id", booking_request_id).execute()
 
 
+def _anonymize_booking_privacy(client, booking_request_id: str) -> str:
+    result = client.rpc(
+        "anonymize_cancelled_booking",
+        {"p_booking_request_id": booking_request_id},
+    ).execute()
+    data = result.data
+    row = data[0] if isinstance(data, list) and data else data
+    if not isinstance(row, dict):
+        return "Personal details could not be removed. Please contact reception."
+    proof_paths = row.get("proof_paths") or []
+    if proof_paths:
+        client.storage.from_(BUCKET).remove(proof_paths)
+    if row.get("personal_data_removed"):
+        return "Personal details removed."
+    return row.get("reason") or "Personal details retained because another active booking exists."
+
+
 async def _cancel_stored_appointments(rows: list[dict]) -> list[tuple[dict, bool, str | None]]:
     client = _client()
     outcomes = []
+    request_ids: set[str] = set()
     for row in rows:
         try:
             result = await asyncio.to_thread(
@@ -1735,6 +1840,7 @@ async def _cancel_stored_appointments(rows: list[dict]) -> list[tuple[dict, bool
                     .execute()
                 )
                 if row.get("booking_request_id"):
+                    request_ids.add(row["booking_request_id"])
                     try:
                         await asyncio.to_thread(
                             _cancel_linked_booking_request,
@@ -1750,7 +1856,39 @@ async def _cancel_stored_appointments(rows: list[dict]) -> list[tuple[dict, bool
         except Exception:
             logger.exception("Stored appointment cancellation failed", extra={"appointment_id": row.get("id")})
             outcomes.append((row, False, "The appointment could not be cancelled."))
-    return outcomes
+
+    privacy_notes: dict[str, str] = {}
+    for request_id in request_ids:
+        try:
+            remaining = await asyncio.to_thread(
+                lambda rid=request_id: client.table("appointments")
+                .select("id")
+                .eq("clinic_id", _clinic_id())
+                .eq("booking_request_id", rid)
+                .in_("status", ["pending", "confirmed"])
+                .execute()
+                .data
+                or []
+            )
+            if remaining:
+                continue
+            privacy_notes[request_id] = await asyncio.to_thread(
+                _anonymize_booking_privacy, client, request_id
+            )
+        except Exception:
+            logger.exception(
+                "Booking privacy cleanup failed",
+                extra={"booking_request_id": request_id},
+            )
+            privacy_notes[request_id] = (
+                "Personal details could not be removed. Please contact reception."
+            )
+
+    final = []
+    for row, ok, reason in outcomes:
+        note = privacy_notes.get(row.get("booking_request_id")) if ok else None
+        final.append((row, ok, note or reason))
+    return final
 
 
 def _reschedule_target(row: dict) -> dict:
@@ -1829,19 +1967,21 @@ async def _show_reschedule_slots(update_or_query, context):
             "reschedule. Please contact reception or try again later."
         )
         return
-    if not result.slots:
+    now_check = datetime.now(timezone)
+    available = [slot for slot in result.slots if slot.start_at > now_check]
+    if not available:
         await message.edit_text(
             f"No available times for {target['reference']} in the next "
             f"{get_settings().availability_search_days} days. Please contact reception."
         )
         return
-    context.user_data["slots"] = result.slots
+    context.user_data["slots"] = available
     rows = [
         [InlineKeyboardButton(
             slot.start_at.astimezone(timezone).strftime("%a %d %b, %I:%M %p"),
             callback_data=f"resched-slot:{index}",
         )]
-        for index, slot in enumerate(result.slots)
+        for index, slot in enumerate(available)
     ]
     await message.edit_text(
         f"Available new times for {target['reference']} (live availability):",
