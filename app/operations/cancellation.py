@@ -211,6 +211,8 @@ def _cancel_appointment(
             contact_id=normalized_contact_id,
             appointment_id=appointment.id,
             expected_status=appointment.status,
+            reason=actor.reason or f"{actor.actor_type.value.capitalize()} cancelled the appointment",
+            source=actor.actor_type.value,
             client=supabase,
         )
     except AppointmentStateError:

@@ -255,7 +255,11 @@ def cancel_pending_appointment(
     response = (
         (client or get_supabase_client())
         .table("appointments")
-        .update({"status": "cancelled"})
+        .update({
+            "status": "cancelled",
+            "cancellation_reason": "Pending appointment cancelled before confirmation",
+            "cancellation_source": "system",
+        })
         .eq("clinic_id", str(UUID(str(clinic_id))))
         .eq("id", str(UUID(str(appointment_id))))
         .eq("status", "pending")
@@ -321,12 +325,18 @@ def cancel_appointment_record(
     contact_id: str,
     appointment_id: str,
     expected_status: str,
+    reason: str | None = None,
+    source: str = "system",
     client: Client | None = None,
 ) -> AppointmentRecord:
     response = (
         (client or get_supabase_client())
         .table("appointments")
-        .update({"status": "cancelled"})
+        .update({
+            "status": "cancelled",
+            "cancellation_reason": reason or "Appointment cancelled",
+            "cancellation_source": source,
+        })
         .eq("clinic_id", str(UUID(str(clinic_id))))
         .eq("contact_id", str(UUID(str(contact_id))))
         .eq("id", str(UUID(str(appointment_id))))
