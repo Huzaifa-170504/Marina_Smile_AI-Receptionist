@@ -369,7 +369,7 @@ npm.cmd run typecheck
 npm.cmd run build
 ```
 
-Current suites: **244 backend tests** and **27 dashboard tests**. Unit tests do
+Current suites: **246 backend tests** and **27 dashboard tests**. Unit tests do
 not prove hosted credentials, Calendar permissions, migrations, Telegram
 polling, or deployments work; verify those separately.
 
@@ -396,6 +396,86 @@ polling, or deployments work; verify those separately.
 Telegram polling and the notification worker start automatically inside the
 Render web process when `TELEGRAM_BOT_TOKEN` is present. Reminders depend on that
 process staying up.
+
+## Guardrails
+
+### AI and medical safety
+
+- Answers are limited to Marina Smile and its dental services; the model may not
+  invent doctors, services, prices, slots, policies, or outcomes.
+- The model may not diagnose, prescribe, recommend dosages, interpret records,
+  or guarantee treatment outcomes.
+- Difficulty breathing, difficulty swallowing, severe facial swelling, and
+  uncontrolled bleeding trigger immediate emergency-care guidance in the bot
+  before any AI or booking flow.
+- Messages and uploaded documents are treated as untrusted data. Prompt
+  injection, system-prompt disclosure, credential disclosure, and AI-generated
+  SQL/shell access are prohibited.
+- The model may not claim a booking, cancellation, reschedule, or payment
+  succeeded; those results come only from backend confirmation.
+
+### Appointments
+
+- Patient identity is linked to the Telegram chat that booked the record.
+- Booking requires an explicit **Confirm booking** step after the full summary
+  is shown. Rescheduling likewise requires an explicit confirmation.
+- Availability is revalidated against schedules, database conflicts, and Google
+  Calendar before an appointment is confirmed.
+- Booking, rescheduling, cancellation, payments, and notification claims use
+  database constraints, RPC transactions, and idempotency keys.
+- Cancellation/rescheduling never proceed without user confirmation.
+- Appointment changes are recorded in the append-only audit log.
+- A missed reminder never cancels an appointment.
+
+### Privacy
+
+- Supabase RLS protects staff/dashboard access.
+- The bot uses a patient-safe table/RPC allowlist and only exposes contacts
+  linked to the current Telegram chat.
+- Cancellation anonymises personal identifiers when no other active booking
+  requires them and deletes receipt images.
+- Logs use internal IDs rather than patient names or phone numbers.
+
+### Payments
+
+- Screenshots are always `submitted` until an authorized staff member verifies
+  them.
+- Amounts are validated during verification; cash settlement is staff-only.
+- Duplicate payment submissions are prevented by idempotency keys.
+- Refunds require authorized staff review and payout.
+- The AI cannot read or modify payment records.
+
+### Notifications
+
+- Confirmations are recorded only after successful database operations.
+- Database triggers schedule 24-hour/2-hour reminders, move them on
+  rescheduling, and cancel them on cancellation/no-show/completion.
+- The worker re-checks appointment status immediately before sending.
+- Unique event keys and reminder numbers prevent duplicate notifications.
+- Failed deliveries retry up to 3 times with a 5-minute delay and are logged in
+  `outbound_notifications`.
+- A delivery failure never changes an appointment.
+- Reminder messages omit treatment names; full details remain available inside
+  **My Appointments**.
+- Appointment messages are transactional notifications for a booking the
+  patient made; no marketing messages are sent.
+
+### Security, handoff, and reliability
+
+- Telegram messages and callbacks are rate-limited per chat.
+- Patient-sensitive actions are authorized by backend code, not AI decisions.
+- Google Calendar calls have bounded timeouts; booking compensates on external
+  failures.
+- The Help menu can create a staff handoff for human assistance.
+- Booking, rescheduling, cancellation, notification invalidation, payment
+  failures, prompt-injection, emergency detection, and concurrency are covered
+  by tests.
+- Structured logs cover failed bookings, duplicate attempts, rejected patient
+  lookups, notification failures, and AI answers escalated to reception.
+- The bot uses Telegram long polling rather than a webhook, so there is no
+  webhook endpoint to validate; duplicate updates are absorbed by idempotent
+  booking and database constraints.
+- FastAPI/Pydantic validates API inputs, and hosted traffic uses HTTPS.
 
 ## Security notes
 

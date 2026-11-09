@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 POLL_SECONDS = 60
 SERVED_INTERVAL_SECONDS = 300
 SERVED_GRACE_MINUTES = 30
+MAX_DELIVERY_ATTEMPTS = 3
+RETRY_DELAY_MINUTES = 5
 
 SUPPORTED_TYPES = frozenset({
     "booking_confirmation",
@@ -60,6 +62,29 @@ def _cancel_notification(notification_id: str, reason: str) -> None:
     client.table("outbound_notifications").update(
         {"status": "cancelled", "last_error": reason[:1000]}
     ).eq("id", notification_id).execute()
+
+
+def _retry_notification(
+    notification_id: str,
+    error: str,
+    attempt_count: int,
+) -> None:
+    if attempt_count >= MAX_DELIVERY_ATTEMPTS:
+        _complete_notification(notification_id, error=error)
+        return
+    client = get_supabase_client()
+    retry_at = datetime.now(timezone.utc) + timedelta(minutes=RETRY_DELAY_MINUTES)
+    try:
+        client.table("outbound_notifications").update(
+            {
+                "status": "pending",
+                "scheduled_at": retry_at.isoformat(),
+                "last_error": error[:1000],
+            }
+        ).eq("id", notification_id).execute()
+    except Exception:
+        logger.exception("Notification retry scheduling failed")
+        _complete_notification(notification_id, error=error)
 
 
 def _load_contact(contact_id: str) -> dict | None:
@@ -197,9 +222,8 @@ def _format_notification(
             f"{greeting}Reference: {reference}\n"
             f"When: {when}\n"
             f"Doctor: {doctor}\n"
-            f"Services: {services}\n"
             f"Payment: {payment}\n\n"
-            "Use My Appointments in the bot to reschedule or cancel."
+            "Open My Appointments for full details, or to reschedule or cancel."
         )
     if notification_type == "final_reminder":
         return (
@@ -207,9 +231,9 @@ def _format_notification(
             f"{greeting}Reference: {reference}\n"
             f"When: {when}\n"
             f"Doctor: {doctor}\n"
-            f"Services: {services}\n"
             f"Payment: {payment}\n\n"
-            "Please arrive a few minutes early. Use My Appointments to reschedule or cancel."
+            "Please arrive a few minutes early. Open My Appointments for full details, "
+            "or to reschedule or cancel."
         )
     if notification_type == "feedback_request":
         return (
@@ -251,6 +275,7 @@ def _format_notification(
 async def _deliver(bot: Bot, notification: dict) -> None:
     notification_id = notification["id"]
     notification_type = notification.get("notification_type")
+    attempt_count = int(notification.get("attempt_count") or 0)
     try:
         if notification_type not in SUPPORTED_TYPES:
             await asyncio.to_thread(
@@ -307,10 +332,14 @@ async def _deliver(bot: Bot, notification: dict) -> None:
         await asyncio.to_thread(_complete_notification, notification_id)
     except TelegramError as exc:
         logger.warning("Telegram notification delivery failed: %s", exc)
-        await asyncio.to_thread(_complete_notification, notification_id, error=str(exc))
+        await asyncio.to_thread(
+            _retry_notification, notification_id, str(exc), attempt_count
+        )
     except Exception as exc:  # pragma: no cover - defensive worker boundary
         logger.exception("Notification delivery failed")
-        await asyncio.to_thread(_complete_notification, notification_id, error=str(exc))
+        await asyncio.to_thread(
+            _retry_notification, notification_id, str(exc), attempt_count
+        )
 
 
 async def run_notification_worker(bot: Bot) -> None:
