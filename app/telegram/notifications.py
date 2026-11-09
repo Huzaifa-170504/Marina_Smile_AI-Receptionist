@@ -119,6 +119,29 @@ def _format_when(value: str | None, timezone_name: str) -> str:
         return str(value)
 
 
+def _time_until(value: str | None, now: datetime | None = None) -> str:
+    if not value:
+        return "soon"
+    try:
+        start = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return "soon"
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    minutes = int((start - current).total_seconds() // 60)
+    if minutes <= 0:
+        return "now"
+    if minutes < 60:
+        suffix = "" if minutes == 1 else "s"
+        return f"in about {minutes} minute{suffix}"
+    hours = minutes / 60
+    if hours < 24:
+        rounded = round(hours * 2) / 2
+        return f"in about {rounded:g} hours"
+    return f"in about {hours / 24:.1f} days"
+
+
 def _format_notification(
     notification: dict,
     appointment: dict | None,
@@ -164,10 +187,13 @@ def _format_notification(
         )
 
     greeting = f"Hi {patient_name},\n\n" if patient_name else ""
+    time_until = _time_until(
+        appointment.get("start_at") if appointment else template.get("start_at")
+    )
 
     if notification_type == "appointment_reminder":
         return (
-            f"⏰ Reminder: your appointment is in 24 hours.\n\n"
+            f"⏰ Reminder: your appointment is {time_until}.\n\n"
             f"{greeting}Reference: {reference}\n"
             f"When: {when}\n"
             f"Doctor: {doctor}\n"
@@ -177,7 +203,7 @@ def _format_notification(
         )
     if notification_type == "final_reminder":
         return (
-            f"⏰ Final reminder: your appointment is in 2 hours.\n\n"
+            f"⏰ Final reminder: your appointment is {time_until}.\n\n"
             f"{greeting}Reference: {reference}\n"
             f"When: {when}\n"
             f"Doctor: {doctor}\n"

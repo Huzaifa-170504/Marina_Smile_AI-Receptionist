@@ -1403,6 +1403,40 @@ async def _show_booking_slots(update_or_query, context):
             "appointment. Please contact reception."
         )
         return
+
+    # Slots freed by a future cancellation are available again and should be
+    # shown first, ahead of ordinary chronological order.
+    freed_starts: set[datetime] = set()
+    try:
+        search_end = now_check + timedelta(
+            days=get_settings().availability_search_days
+        )
+        cancelled = await asyncio.to_thread(
+            lambda: _client().table("appointments")
+            .select("start_at")
+            .eq("clinic_id", _clinic_id())
+            .eq("dentist_id", doctor_id)
+            .eq("status", "cancelled")
+            .gte("start_at", now_check.isoformat())
+            .lte("start_at", search_end.isoformat())
+            .execute()
+            .data
+            or []
+        )
+        freed_starts = {
+            parsed
+            for parsed in (_parse_ts(row.get("start_at")) for row in cancelled)
+            if parsed is not None
+        }
+    except Exception:
+        logger.exception("Failed to load cancelled slots for booking display")
+
+    available.sort(
+        key=lambda slot: (
+            0 if slot.start_at in freed_starts else 1,
+            slot.start_at,
+        )
+    )
     context.user_data["slots"] = available
     rows = [
         [InlineKeyboardButton(
