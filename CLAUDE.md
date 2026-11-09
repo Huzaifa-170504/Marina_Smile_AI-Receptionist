@@ -78,7 +78,7 @@ There is no Supabase CLI configuration in the repo. Migrations are applied **man
   - Patient lookups are bound to the Telegram chat ID stored on the contact; a different Telegram account is refused.
   - Cancelling a booking erases the patient/contact identifiers unless another active booking needs them, and removes receipt files. Non-identifying appointment/payment/audit rows remain because the audit log is append-only.
   - All bot table/RPC access goes through `PatientSafeSupabase` in `app/telegram/privacy.py`; staff, payroll, refund, and audit tables are blocked even though the bot uses the service-role key.
-- `app/telegram/notifications.py` — claims `outbound_notifications`, sends Telegram reminders, and calls `mark_due_appointments_served`.
+- `app/telegram/notifications.py` — claims `outbound_notifications` and delivers six Telegram notification types: immediate booking/reschedule/cancellation confirmations, 24-hour and 2-hour reminders, and a 2-hour post-completion feedback request. It also calls `mark_due_appointments_served`. Booking creates both reminders; rescheduling moves/creates them; cancellation cancels pending ones; a database trigger schedules feedback when an appointment becomes `completed`.
 - `app/ai/`, `app/rag/` — Gemini generation + pgvector retrieval. Operational facts must come from repositories, not model memory.
 - `app/integrations/google_calendar.py` — service-account Calendar client. Availability and booking **require** `clinics.google_calendar_id`; the calendar must be shared with the service account with `Make changes to events`. Empty calendar ID raises `CalendarUnavailableError`/`CalendarWriteError`.
 
@@ -117,7 +117,7 @@ Never expose `SUPABASE_SECRET_KEY`, Gemini keys, Google private keys, or `DEMO_A
 
 ## Verification expectations
 
-- Python suite: 239 tests.
+- Python suite: 243 tests.
 - Dashboard suite: 27 tests across 10 files.
 - TypeScript must pass `npm run typecheck`.
 - Tests do not prove live Supabase constraints, Calendar permissions, migrations, Telegram polling, or Render/Vercel deploys. Verify those separately against the hosted services.

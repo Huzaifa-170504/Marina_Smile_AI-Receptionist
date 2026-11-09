@@ -20,6 +20,7 @@ from app.core.config import get_settings
 from app.database.supabase import get_supabase_client
 from app.operations.appointment_change_models import AppointmentActor, AppointmentActorType
 from app.operations.cancellation import cancel_appointment
+from app.operations import appointment_notifications
 from app.operations.patient_booking import (
     PatientBookingError,
     active_booking_for_patient,
@@ -885,6 +886,19 @@ async def _callbacks(update, context):
                 }).execute()
             )
             try:
+                await asyncio.to_thread(
+                    appointment_notifications.record_immediate_notification,
+                    _client(),
+                    clinic_id=_clinic_id(),
+                    contact_id=row.get("contact_id"),
+                    booking_request_id=request_id,
+                    notification_type="cancellation_confirmation",
+                    template_data={},
+                    event_key=f"cancellation_confirmation:request:{request_id}",
+                )
+            except Exception:
+                logger.exception("Cancellation notification record failed")
+            try:
                 note = await asyncio.to_thread(
                     _anonymize_booking_privacy, _client(), request_id
                 )
@@ -1081,6 +1095,44 @@ async def _callbacks(update, context):
                         slot.start_at - old_start,
                     )
                 clinic = await asyncio.to_thread(get_active_clinic, target["clinic_id"])
+                template = {
+                    "appointment_reference": target["reference"],
+                    "start_at": slot.start_at.isoformat(),
+                    "clinic_name": clinic.name,
+                    "timezone": clinic.timezone,
+                    "dentist_name": target.get("dentist_name"),
+                    "services": target.get("service_names"),
+                }
+                try:
+                    await asyncio.to_thread(
+                        appointment_notifications.record_immediate_notification,
+                        _client(),
+                        clinic_id=target["clinic_id"],
+                        contact_id=target["contact_id"],
+                        booking_request_id=target.get("booking_request_id"),
+                        appointment_id=target["appointment_id"],
+                        notification_type="reschedule_confirmation",
+                        template_data=template,
+                        event_key=(
+                            f"reschedule_confirmation:{target['appointment_id']}:"
+                            f"{slot.start_at.isoformat()}"
+                        ),
+                    )
+                    await asyncio.to_thread(
+                        appointment_notifications.schedule_appointment_reminders,
+                        _client(),
+                        clinic_id=target["clinic_id"],
+                        contact_id=target["contact_id"],
+                        booking_request_id=target.get("booking_request_id"),
+                        appointment_id=target["appointment_id"],
+                        start_at=slot.start_at,
+                        template_data=template,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Reschedule notification scheduling failed",
+                        extra={"appointment_id": target["appointment_id"]},
+                    )
                 await query.edit_message_text(
                     f"{target['reference']} rescheduled to "
                     f"{_when_text(slot.start_at.isoformat(), clinic.timezone)}."
@@ -1108,6 +1160,28 @@ async def _callbacks(update, context):
             await asyncio.to_thread(lambda: _client().rpc("transition_booking_request", {
                 "p_booking_request_id": request_id, "p_expected_status": expected,
                 "p_target_status": "cancelled"}).execute())
+            try:
+                rows = await asyncio.to_thread(
+                    lambda: _client().table("booking_requests")
+                    .select("contact_id")
+                    .eq("id", request_id)
+                    .limit(1)
+                    .execute()
+                    .data
+                    or []
+                )
+                await asyncio.to_thread(
+                    appointment_notifications.record_immediate_notification,
+                    _client(),
+                    clinic_id=_clinic_id(),
+                    contact_id=rows[0]["contact_id"] if rows else None,
+                    booking_request_id=request_id,
+                    notification_type="cancellation_confirmation",
+                    template_data={},
+                    event_key=f"cancellation_confirmation:request:{request_id}",
+                )
+            except Exception:
+                logger.exception("Cancellation notification record failed")
             try:
                 note = await asyncio.to_thread(
                     _anonymize_booking_privacy, _client(), request_id
@@ -1655,9 +1729,10 @@ def _load_patient_appointments(patient_ids: list[str]) -> list[dict]:
 
 def _load_patient_booking_requests(patient_ids: list[str]) -> list[dict]:
     return _client().table("booking_requests").select(
-        "id,status,preferred_dentist_id,preferred_window_start,preferred_window_end,"
-        "total_amount,currency,payment_mode,payment_status,service_id,created_at,"
-        "booking_request_services(service_name,start_at,end_at),dentists(name)"
+        "id,status,patient_id,contact_id,preferred_dentist_id,preferred_window_start,"
+        "preferred_window_end,total_amount,currency,payment_mode,payment_status,"
+        "service_id,created_at,booking_request_services(service_name,start_at,end_at),"
+        "dentists(name)"
     ).eq("clinic_id", _clinic_id()).in_("patient_id", patient_ids).in_(
         "status",
         [
@@ -1832,13 +1907,30 @@ async def _cancel_stored_appointments(rows: list[dict]) -> list[tuple[dict, bool
             ok = result.status.value in {"CANCELLED", "ALREADY_CANCELLED"}
             if ok:
                 await asyncio.to_thread(
-                    lambda appointment_id=row["id"]: client.table("outbound_notifications")
-                    .update({"status": "cancelled"})
-                    .eq("clinic_id", _clinic_id())
-                    .eq("appointment_id", appointment_id)
-                    .eq("status", "pending")
-                    .execute()
+                    appointment_notifications.cancel_pending_notifications,
+                    client,
+                    clinic_id=_clinic_id(),
+                    appointment_id=row["id"],
                 )
+                try:
+                    await asyncio.to_thread(
+                        appointment_notifications.record_immediate_notification,
+                        client,
+                        clinic_id=_clinic_id(),
+                        contact_id=row.get("contact_id"),
+                        booking_request_id=row.get("booking_request_id"),
+                        appointment_id=row["id"],
+                        notification_type="cancellation_confirmation",
+                        template_data={
+                            "appointment_reference": row.get("appointment_reference")
+                        },
+                        event_key=f"cancellation_confirmation:{row['id']}",
+                    )
+                except Exception:
+                    logger.exception(
+                        "Cancellation notification record failed",
+                        extra={"appointment_id": row["id"]},
+                    )
                 if row.get("booking_request_id"):
                     request_ids.add(row["booking_request_id"])
                     try:
@@ -1906,9 +1998,11 @@ def _reschedule_target(row: dict) -> dict:
     return {
         "clinic_id": _clinic_id(),
         "appointment_id": row["id"],
+        "booking_request_id": row.get("booking_request_id"),
         "contact_id": row["contact_id"],
         "patient_id": row["patient_id"],
         "dentist_id": row["dentist_id"],
+        "dentist_name": (row.get("dentists") or {}).get("name"),
         "event_id": row.get("google_calendar_event_id"),
         "duration_minutes": duration or 30,
         "service_ids": service_ids,
