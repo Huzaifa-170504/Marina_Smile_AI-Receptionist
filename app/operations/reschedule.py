@@ -115,6 +115,9 @@ def reschedule_appointment(
     new_dentist_id: str | None = None,
     requested_service_id: str | None = None,
     request_id: str | None = None,
+    duration_minutes_override: int | None = None,
+    required_service_ids: list[str] | None = None,
+    service_name_override: str | None = None,
     now: datetime | None = None,
     client: Client | None = None,
     calendar_client: CalendarAppointmentChangeClient | None = None,
@@ -129,6 +132,9 @@ def reschedule_appointment(
             new_dentist_id=new_dentist_id,
             requested_service_id=requested_service_id,
             request_id=request_id,
+            duration_minutes_override=duration_minutes_override,
+            required_service_ids=required_service_ids,
+            service_name_override=service_name_override,
             now=now,
             client=client,
             calendar_client=calendar_client,
@@ -165,6 +171,9 @@ def _reschedule_appointment(
     new_dentist_id: str | None,
     requested_service_id: str | None,
     request_id: str | None,
+    duration_minutes_override: int | None,
+    required_service_ids: list[str] | None,
+    service_name_override: str | None,
     now: datetime | None,
     client: Client | None,
     calendar_client: CalendarAppointmentChangeClient | None,
@@ -261,6 +270,40 @@ def _reschedule_appointment(
             actor,
             reason="The appointment service or its duration is unavailable.",
         )
+
+    try:
+        normalized_required_ids = [
+            str(UUID(str(value)))
+            for value in (required_service_ids or [service.id])
+        ]
+    except ValueError:
+        return _result(
+            RescheduleStatus.ERROR,
+            appointment,
+            actor,
+            reason="One or more required services are invalid.",
+        )
+    required_services = []
+    for service_id in normalized_required_ids:
+        item = next((row for row in services if row.id == service_id), None)
+        if item is None:
+            return _result(
+                RescheduleStatus.ERROR,
+                appointment,
+                actor,
+                reason="A selected service is no longer active.",
+            )
+        required_services.append(item)
+    effective_duration = duration_minutes_override or service.duration_minutes
+    if not effective_duration or effective_duration <= 0:
+        return _result(
+            RescheduleStatus.ERROR,
+            appointment,
+            actor,
+            reason="The appointment duration is unavailable.",
+        )
+    display_service_name = service_name_override or service.name
+
     dentists = list_active_dentists(normalized_clinic_id, client=supabase)
     target_dentist_id = normalized_dentist_id or appointment.dentist_id
     dentist = next((item for item in dentists if item.id == target_dentist_id), None)
@@ -271,21 +314,22 @@ def _reschedule_appointment(
             actor,
             reason="The requested active dentist was not found.",
         )
-    if not filter_dentists_for_service(
-        normalized_clinic_id,
-        [dentist],
-        service.id,
-        client=supabase,
-    ):
-        return _result(
-            RescheduleStatus.DENTIST_SERVICE_MISMATCH,
-            appointment,
-            actor,
-            dentist_id=dentist.id,
-            dentist_name=dentist.name,
-            service_name=service.name,
-            reason="The requested dentist does not provide this service.",
-        )
+    for required_service in required_services:
+        if not filter_dentists_for_service(
+            normalized_clinic_id,
+            [dentist],
+            required_service.id,
+            client=supabase,
+        ):
+            return _result(
+                RescheduleStatus.DENTIST_SERVICE_MISMATCH,
+                appointment,
+                actor,
+                dentist_id=dentist.id,
+                dentist_name=dentist.name,
+                service_name=display_service_name,
+                reason="The requested dentist does not provide every selected service.",
+            )
 
     try:
         timezone = ZoneInfo(clinic.timezone)
@@ -297,7 +341,7 @@ def _reschedule_appointment(
             reason="The clinic timezone is invalid.",
         )
     local_start = new_start_at.astimezone(timezone)
-    new_end_at = local_start + timedelta(minutes=service.duration_minutes)
+    new_end_at = local_start + timedelta(minutes=effective_duration)
     current = now or datetime.now(timezone)
     if current.tzinfo is None or local_start <= current.astimezone(timezone):
         return _result(
@@ -306,7 +350,7 @@ def _reschedule_appointment(
             actor,
             dentist_id=dentist.id,
             dentist_name=dentist.name,
-            service_name=service.name,
+            service_name=display_service_name,
             new_start_at=local_start,
             new_end_at=new_end_at,
             reason="The new appointment time must be in the future.",
@@ -323,7 +367,7 @@ def _reschedule_appointment(
         schedules,
         window_start=local_start,
         window_end=new_end_at,
-        duration_minutes=service.duration_minutes,
+        duration_minutes=effective_duration,
         interval_minutes=settings.availability_slot_interval_minutes,
         timezone=timezone,
     )
@@ -334,7 +378,7 @@ def _reschedule_appointment(
             actor,
             dentist_id=dentist.id,
             dentist_name=dentist.name,
-            service_name=service.name,
+            service_name=display_service_name,
             new_start_at=local_start,
             new_end_at=new_end_at,
             reason="The selected time is outside the dentist's working hours.",
@@ -355,7 +399,7 @@ def _reschedule_appointment(
             actor,
             dentist_id=dentist.id,
             dentist_name=dentist.name,
-            service_name=service.name,
+            service_name=display_service_name,
             new_start_at=local_start,
             new_end_at=new_end_at,
             reason="The selected interval already has an active appointment.",
@@ -401,7 +445,7 @@ def _reschedule_appointment(
             actor,
             dentist_id=dentist.id,
             dentist_name=dentist.name,
-            service_name=service.name,
+            service_name=display_service_name,
             new_start_at=local_start,
             new_end_at=new_end_at,
             reason="The selected interval conflicts with the clinic Calendar.",
@@ -428,7 +472,7 @@ def _reschedule_appointment(
             actor,
             dentist_id=dentist.id,
             dentist_name=dentist.name,
-            service_name=service.name,
+            service_name=display_service_name,
             new_start_at=local_start,
             new_end_at=new_end_at,
             reason="The selected slot was taken by another request.",
@@ -451,7 +495,7 @@ def _reschedule_appointment(
             appointment_id=appointment.id,
             contact_id=normalized_contact_id,
             service_id=service.id,
-            service_name=service.name,
+            service_name=display_service_name,
             start_at=local_start,
             end_at=new_end_at,
             timezone_name=clinic.timezone,
@@ -502,7 +546,7 @@ def _reschedule_appointment(
                 actor,
                 dentist_id=dentist.id,
                 dentist_name=dentist.name,
-                service_name=service.name,
+                service_name=display_service_name,
                 new_start_at=local_start,
                 new_end_at=new_end_at,
                 compensation_succeeded=False,
@@ -514,7 +558,7 @@ def _reschedule_appointment(
             actor,
             dentist_id=dentist.id,
             dentist_name=dentist.name,
-            service_name=service.name,
+            service_name=display_service_name,
             new_start_at=local_start,
             new_end_at=new_end_at,
             compensation_succeeded=True,
@@ -539,7 +583,7 @@ def _reschedule_appointment(
         actor,
         dentist_id=dentist.id,
         dentist_name=dentist.name,
-        service_name=service.name,
+        service_name=display_service_name,
         new_start_at=local_start,
         new_end_at=new_end_at,
     )
