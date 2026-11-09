@@ -622,7 +622,13 @@ async def _verify_lookup_identifier(update, context):
         await _payments(update, patients)
     elif target == "appointments":
         context.user_data["lookup_patients"] = patients
-        await _my_appointments(update, patients, context)
+        try:
+            await _my_appointments(update, patients, context)
+        except Exception:
+            logger.exception("Telegram appointment dashboard failed")
+            await update.effective_message.reply_text(
+                "Appointments are temporarily unavailable. Please try again."
+            )
 
 
 async def _begin_booking(update, context):
@@ -794,7 +800,13 @@ async def _callbacks(update, context):
 
     if data == "my-appointments":
         patients = context.user_data.get("lookup_patients") or []
-        await _my_appointments(query, patients, context)
+        try:
+            await _my_appointments(query, patients, context)
+        except Exception:
+            logger.exception("Telegram appointment dashboard refresh failed")
+            await query.message.reply_text(
+                "Appointments are temporarily unavailable. Please try again."
+            )
         return
 
     if data.startswith("appt-view:"):
