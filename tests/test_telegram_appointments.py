@@ -89,3 +89,62 @@ def test_appointment_detail_lines_show_each_service_and_payment() -> None:
     assert "Composite filling" in text
     assert "AED 500.00" in text
     assert "cash · unpaid" in text
+
+
+def test_profile_steps_request_missing_name_age_and_gender() -> None:
+    profile = {"name": None, "age": None, "gender": None}
+    assert bot._next_profile_step(None, profile) == "name"
+
+    profile["name"] = "Sara Ali"
+    assert bot._next_profile_step(None, profile) == "age"
+
+    profile["age"] = 30
+    assert bot._next_profile_step(None, profile) == "gender"
+
+    profile["gender"] = "female"
+    assert bot._next_profile_step(None, profile) is None
+
+    existing = {
+        "name": "Sara Ali",
+        "age_at_registration": 30,
+        "gender": "female",
+    }
+    assert bot._next_profile_step(existing, {"name": None, "age": None, "gender": None}) is None
+
+
+def test_booking_services_are_scheduled_sequentially() -> None:
+    start = datetime(2026, 11, 10, 10, 0, tzinfo=timezone.utc)
+    booking = {
+        "slot": {
+            "start_at": start.isoformat(),
+            "end_at": (start + timedelta(minutes=75)).isoformat(),
+        },
+        "dentist_id": "dentist-1",
+        "service_order": ["service-1", "service-2"],
+        "services": {
+            "service-1": {
+                "name": "Scaling and polishing",
+                "duration_minutes": 45,
+                "price_from": 350,
+                "currency": "AED",
+            },
+            "service-2": {
+                "name": "Composite filling",
+                "duration_minutes": 30,
+                "price_from": 400,
+                "currency": "AED",
+            },
+        },
+    }
+
+    lines = bot._booking_services_with_times(booking)
+
+    assert [line["name"] for line in lines] == [
+        "Scaling and polishing",
+        "Composite filling",
+    ]
+    assert lines[0]["start_at"] == start.isoformat()
+    assert lines[0]["end_at"] == (start + timedelta(minutes=45)).isoformat()
+    assert lines[1]["start_at"] == (start + timedelta(minutes=45)).isoformat()
+    assert lines[1]["end_at"] == (start + timedelta(minutes=75)).isoformat()
+    assert sum(line["price_amount"] for line in lines) == 750

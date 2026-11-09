@@ -125,7 +125,7 @@ def lookup_identities(
     contact_ids = [contact["id"] for contact in contacts]
     patients = (
         supabase.table("patients")
-        .select("id,full_name,primary_contact_id,active,age_at_registration,gender")
+        .select("id,patient_number,full_name,primary_contact_id,active,age_at_registration,gender")
         .eq("clinic_id", clinic_id)
         .in_("primary_contact_id", contact_ids)
         .execute()
@@ -198,7 +198,7 @@ def resolve_or_register_patient(
 
     patients = (
         supabase.table("patients")
-        .select("id,full_name,primary_contact_id,active,age_at_registration,gender")
+        .select("id,patient_number,full_name,primary_contact_id,active,age_at_registration,gender")
         .eq("clinic_id", clinic_id)
         .eq("primary_contact_id", contact["id"])
         .execute()
@@ -221,6 +221,7 @@ def resolve_or_register_patient(
                 "clinic_id": clinic_id,
                 "contact_id": contact["id"],
                 "patient_id": patient["id"],
+                "patient_number": patient.get("patient_number"),
                 "name": patient["full_name"],
                 "age_at_registration": patient.get("age_at_registration"),
                 "gender": patient.get("gender"),
@@ -256,6 +257,7 @@ def resolve_or_register_patient(
         "clinic_id": clinic_id,
         "contact_id": contact["id"],
         "patient_id": patient["id"],
+        "patient_number": patient.get("patient_number"),
         "name": patient["full_name"],
         "age_at_registration": patient.get("age_at_registration"),
         "gender": patient.get("gender"),
