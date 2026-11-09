@@ -119,6 +119,15 @@ Never expose `SUPABASE_SECRET_KEY`, Gemini keys, Google private keys, or `DEMO_A
 - TypeScript must pass `npm run typecheck`.
 - Tests do not prove live Supabase constraints, Calendar permissions, migrations, Telegram polling, or Render/Vercel deploys. Verify those separately against the hosted services.
 
+## Known gaps (verified, not implemented)
+
+- Multi-doctor/multi-visit booking plans, alternative-combination ranking, and partial-booking consent.
+- Temporary slot holds and waiting-list management.
+- Per-service cancellation inside a multi-service appointment (the current plan is one appointment row; cancellation is per appointment/plan).
+- Attendance confirmation, 2-hour reminders, reception no-show review, and repeat-no-show policies.
+- Persistent Telegram conversation state (`conversations.workflow_*` exists but is unused; bot state is in-memory).
+- AI tool-calling for booking actions; Gemini handles grounded answers and intent only.
+
 ## Deployment
 
 - Backend: Render Blueprint `render.yaml` (`marina-smile-api`), start command `uvicorn app.main:app`.
