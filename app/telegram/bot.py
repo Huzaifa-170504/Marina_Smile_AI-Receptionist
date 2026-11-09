@@ -1127,10 +1127,37 @@ async def _show_booking_slots(update_or_query, context):
             "I couldn't check availability right now. Please try again."
         )
         return
+    logger.info(
+        "Booking slot search",
+        extra={
+            "doctor_id": doctor_id,
+            "duration_minutes": duration,
+            "status": result.status.value,
+            "slot_count": len(result.slots),
+            "reason": result.reason,
+        },
+    )
+    if result.status.value == "CALENDAR_UNAVAILABLE":
+        await message.edit_text(
+            "Google Calendar availability is unavailable right now, so I can't safely "
+            "offer slots. Please contact reception or try again later."
+        )
+        return
+    if result.status.value in {"SERVICE_NOT_FOUND", "DENTIST_NOT_FOUND"}:
+        await message.edit_text(
+            "The selected doctor or service is no longer available. Please start booking again."
+        )
+        return
+    if result.status.value == "NEEDS_CLARIFICATION":
+        await message.edit_text(
+            result.reason or "The service duration needs to be confirmed by clinic staff."
+        )
+        return
     if not result.slots:
         await message.edit_text(
             f"No available times with {doctor_name} in the next "
-            f"{get_settings().availability_search_days} days. Please contact reception."
+            f"{get_settings().availability_search_days} days for a {duration}-minute "
+            "appointment. Please contact reception."
         )
         return
     context.user_data["slots"] = result.slots
@@ -1645,6 +1672,22 @@ async def _show_reschedule_slots(update_or_query, context):
         logger.exception("Telegram reschedule availability search failed")
         await message.edit_text(
             "I couldn't check availability right now. Please try again."
+        )
+        return
+    logger.info(
+        "Reschedule slot search",
+        extra={
+            "appointment_id": target["appointment_id"],
+            "duration_minutes": target["duration_minutes"],
+            "status": result.status.value,
+            "slot_count": len(result.slots),
+            "reason": result.reason,
+        },
+    )
+    if result.status.value == "CALENDAR_UNAVAILABLE":
+        await message.edit_text(
+            "Google Calendar availability is unavailable right now, so I can't safely "
+            "reschedule. Please contact reception or try again later."
         )
         return
     if not result.slots:
