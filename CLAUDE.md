@@ -55,7 +55,7 @@ Operational CLIs (they print a preview and require confirmation for mutations):
 There is no Supabase CLI configuration in the repo. Migrations are applied **manually in the Supabase SQL editor**, in filename order. Each file wraps its work in `begin; ... commit;`.
 
 - Files `0001`–`0016` are the canonical base.
-- Timestamped files (`20261020…`, `20261106…`, `20261109…`) are additive releases. Recent additions cover per-service schedules, live patient-identity reconciliation, and booking-plan cancellation. Never edit a migration that has already been applied; add a new timestamped file.
+- Timestamped files (`20261020…`, `20261106…`, `20261109…`) are additive releases. Recent additions cover per-service schedules, live patient-identity reconciliation, booking-plan cancellation, the legacy payment-gate removal, privacy cleanup, notification scheduling, reminder timing, and multi-contact Telegram linking. Never edit a migration that has already been applied; add a new timestamped file.
 - The live database may differ from the canonical files. Previous work hit live-only constraints (`patients_check` requiring DOB/age, `contacts.phone_number NOT NULL`). When a write fails with `23514` or `23502`, inspect the live constraint and reconcile it with a new migration rather than editing applied ones.
 - `supabase/tests/README.md` describes the SQL integrity/RLS suite; it requires a disposable project and is not run by `pytest`.
 
@@ -93,9 +93,9 @@ Important invariants:
 - Payment modes:
   - `cash`: appointment confirms immediately with `payment_status = 'unpaid'`; staff settle it later (`mark_cash_payment_paid`).
   - `online`: receipt is uploaded to `payment-proofs`; `verify_payment` marks the request `payment_verified`, and the API then finalizes the appointment.
-- Contact identity is unique per clinic for normalized phone, email, and Telegram chat ID. One contact can have multiple patients (family), but the same phone/email cannot register a second distinct patient silently.
+- Contact identity is unique per clinic for normalized phone and email. One Telegram chat may be linked to more than one contact (for example, family members), but the bot still refuses a second distinct patient under the same phone/email. Patient lookups only expose contacts linked to the current Telegram chat.
 - Duplicate unserved bookings are blocked in the bot. Overdue never-checked-in visits are reconciled to `no_show`.
-- 24-hour reminders are inserted as `outbound_notifications` when an appointment is confirmed and delivered by the polling worker.
+- Appointment confirmation, rescheduling, cancellation, 24-hour/2-hour reminders, and post-completion feedback all use `outbound_notifications`. Database triggers own reminder scheduling and cancellation; the polling worker delivers due rows and re-checks appointment status before sending.
 
 ### Dashboard (`dashboard/`)
 
@@ -127,7 +127,7 @@ Never expose `SUPABASE_SECRET_KEY`, Gemini keys, Google private keys, or `DEMO_A
 - Multi-doctor/multi-visit booking plans, alternative-combination ranking, and partial-booking consent.
 - Temporary slot holds and waiting-list management.
 - Per-service cancellation inside a multi-service appointment (the current plan is one appointment row; cancellation is per appointment/plan).
-- Attendance confirmation, 2-hour reminders, reception no-show review, and repeat-no-show policies.
+- Attendance confirmation, reception no-show review, and repeat-no-show policies.
 - Persistent Telegram conversation state (`conversations.workflow_*` exists but is unused; bot state is in-memory).
 - AI tool-calling for booking actions; Gemini handles grounded answers and intent only.
 
