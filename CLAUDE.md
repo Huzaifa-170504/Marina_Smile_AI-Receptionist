@@ -55,7 +55,7 @@ Operational CLIs (they print a preview and require confirmation for mutations):
 There is no Supabase CLI configuration in the repo. Migrations are applied **manually in the Supabase SQL editor**, in filename order. Each file wraps its work in `begin; ... commit;`.
 
 - Files `0001`–`0016` are the canonical base.
-- Timestamped files (`20261020…`, `20261106…`) are additive releases. Never edit a migration that has already been applied; add a new timestamped file.
+- Timestamped files (`20261020…`, `20261106…`, `20261109…`) are additive releases. Recent additions cover per-service schedules, live patient-identity reconciliation, and booking-plan cancellation. Never edit a migration that has already been applied; add a new timestamped file.
 - The live database may differ from the canonical files. Previous work hit live-only constraints (`patients_check` requiring DOB/age, `contacts.phone_number NOT NULL`). When a write fails with `23514` or `23502`, inspect the live constraint and reconcile it with a new migration rather than editing applied ones.
 - `supabase/tests/README.md` describes the SQL integrity/RLS suite; it requires a disposable project and is not run by `pytest`.
 
@@ -114,7 +114,7 @@ Never expose `SUPABASE_SECRET_KEY`, Gemini keys, Google private keys, or `DEMO_A
 
 ## Verification expectations
 
-- Python suite: 231 tests.
+- Python suite: 234 tests.
 - Dashboard suite: 27 tests across 10 files.
 - TypeScript must pass `npm run typecheck`.
 - Tests do not prove live Supabase constraints, Calendar permissions, migrations, Telegram polling, or Render/Vercel deploys. Verify those separately against the hosted services.
