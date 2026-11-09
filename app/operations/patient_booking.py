@@ -184,6 +184,15 @@ def resolve_or_register_patient(
             created = [contact]
         contact = created[0]
 
+    if (
+        telegram_chat_id is not None
+        and contact.get("telegram_chat_id") is not None
+        and contact.get("telegram_chat_id") != telegram_chat_id
+    ):
+        raise PatientBookingError(
+            "This phone or email is linked to another Telegram account. Please contact reception."
+        )
+
     if telegram_chat_id is not None and contact.get("telegram_chat_id") != telegram_chat_id:
         try:
             supabase.table("contacts").update(

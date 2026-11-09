@@ -215,6 +215,7 @@ def find_available_slots(
                 )
             )
 
+    slots = [slot for slot in slots if slot.start_at >= window_start]
     slots.sort(key=lambda slot: (slot.start_at, slot.dentist_name.casefold()))
     selected_slots = slots[:limit]
     return AvailabilitySearchResult(
