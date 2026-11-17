@@ -419,6 +419,7 @@ Recent additive migrations include:
 - `20261117100000_booking_duplicate_guard.sql`
 - `20261117110000_clinic_hours_and_holidays.sql`
 - `20261117120000_google_holiday_sync.sql`
+- `20261117130000_anonymize_contact_whatsapp_id.sql`
 
 `supabase/tests/README.md` describes the SQL integrity/RLS suite. It requires a
 disposable project and is not run by `pytest`.
