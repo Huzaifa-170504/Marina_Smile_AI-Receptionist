@@ -1,5 +1,6 @@
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
+from app.telegram.bot import _is_main_menu_markup, _menu
 from app.telegram.ui import CANCEL_LABEL, append_cancel, cancel_keyboard
 
 
@@ -25,3 +26,12 @@ def test_append_cancel_does_not_duplicate_main_menu() -> None:
         button.callback_data for row in result.inline_keyboard for button in row
     ]
     assert callbacks == ["main-menu"]
+
+
+def test_main_menu_is_not_treated_as_a_cancellable_workflow() -> None:
+    assert _is_main_menu_markup(_menu())
+    assert not _is_main_menu_markup(
+        ReplyKeyboardMarkup(
+            [[KeyboardButton("Share registered phone", request_contact=True)]]
+        )
+    )

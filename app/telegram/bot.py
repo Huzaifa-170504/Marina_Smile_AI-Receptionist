@@ -37,6 +37,7 @@ from app.operations.patient_booking import (
     find_duplicate_active_service_booking,
     lookup_identities,
     normalize_name,
+    normalize_phone,
     resolve_or_register_patient,
 )
 from app.operations.reschedule import reschedule_appointment
@@ -60,8 +61,10 @@ MENU = (
     ("Help & Contact Reception",),
 )
 IDENTIFIER_PROMPT = (
-    "Enter the phone number you used to book, in international format "
-    "(e.g. +92 311-8917906) or local format (e.g. 03118917906), or your email address."
+    "Enter the phone number you used to book, in international or local format:\n"
+    "• UAE: +971 4 XXX XXXX or 04 XXX XXXX\n"
+    "• Pakistan: +92 300 1234567 or 0300 1234567\n"
+    "Or enter your email address."
 )
 
 EMERGENCY_TERMS = (
@@ -129,10 +132,6 @@ def _clinic_id():
     return str(get_settings().default_clinic_id)
 
 
-def _phone_digits(value: str) -> str:
-    return re.sub(r"\D", "", value)
-
-
 def _normalize_identifier(value: str) -> tuple[str, str] | None:
     value = unicodedata.normalize("NFKC", value).strip()
     if "@" in value:
@@ -140,7 +139,7 @@ def _normalize_identifier(value: str) -> tuple[str, str] | None:
         if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
             return None
         return "email", email
-    phone = _phone_digits(value)
+    phone = normalize_phone(value)
     if not 7 <= len(phone) <= 15:
         return None
     return "phone", phone
@@ -256,7 +255,7 @@ async def _contact(update, context):
     if not contact or not update.effective_user or contact.user_id != update.effective_user.id or not contact.phone_number:
         await update.effective_message.reply_text("Please share your own phone using the button.")
         return
-    context.user_data["booking_identifier"] = ("phone", _phone_digits(contact.phone_number))
+    context.user_data["booking_identifier"] = ("phone", normalize_phone(contact.phone_number))
     context.user_data["booking_chat_id"] = (
         update.effective_chat.id if update.effective_chat else None
     )
@@ -488,7 +487,6 @@ async def _show_booking_review(message, context):
         text,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Confirm booking", callback_data="confirm-booking")],
-            [InlineKeyboardButton("Cancel booking", callback_data="cancel-booking")],
             _main_menu_row(),
         ]),
     )
@@ -1248,45 +1246,6 @@ async def _callbacks(update, context):
         )
         return
 
-    if data.startswith("plan-cancel:"):
-        request_id = data.removeprefix("plan-cancel:")
-        rows = [
-            row for row in (context.user_data.get("appointments") or {}).values()
-            if row.get("booking_request_id") == request_id
-        ]
-        if not rows:
-            await query.edit_message_text("That booking plan is no longer available.")
-            return
-        reference = rows[0].get("appointment_reference") or rows[0]["id"][:8]
-        await query.edit_message_text(
-            f"Cancel the entire booking plan {reference} ({len(rows)} appointment(s))? This cannot be undone.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Yes, cancel plan", callback_data=f"plan-cancel-confirm:{request_id}")],
-                [InlineKeyboardButton("Back to appointments", callback_data="my-appointments")],
-            ]),
-        )
-        return
-
-    if data.startswith("plan-cancel-confirm:"):
-        request_id = data.removeprefix("plan-cancel-confirm:")
-        rows = [
-            row for row in (context.user_data.get("appointments") or {}).values()
-            if row.get("booking_request_id") == request_id
-        ]
-        outcomes = await _cancel_stored_appointments(rows)
-        cancelled = sum(1 for _row, ok, _reason in outcomes if ok)
-        failures = [reason for _row, ok, reason in outcomes if not ok and reason]
-        privacy_notes = sorted({
-            reason for _row, ok, reason in outcomes if ok and reason
-        })
-        text = f"Cancelled {cancelled} of {len(rows)} appointment(s)."
-        if privacy_notes:
-            text += "\n" + "\n".join(privacy_notes)
-        if failures:
-            text += "\n" + "\n".join(failures)
-        await query.edit_message_text(text)
-        return
-
     if data.startswith("appt-reschedule:"):
         row = context.user_data.get("appointments", {}).get(data.removeprefix("appt-reschedule:"))
         if not row:
@@ -1326,16 +1285,8 @@ async def _callbacks(update, context):
             text,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("Confirm reschedule", callback_data="confirm-reschedule")],
-                [InlineKeyboardButton("Cancel", callback_data="cancel-reschedule")],
                 _main_menu_row(),
             ]),
-        )
-        return
-
-    if data == "cancel-reschedule":
-        _clear_flow(context)
-        await query.edit_message_text(
-            "Reschedule cancelled. Your original appointment is unchanged."
         )
         return
 
@@ -1466,11 +1417,6 @@ async def _callbacks(update, context):
             await _confirm_selected_booking(query.message, context)
         finally:
             context.user_data.pop("confirm_lock", None)
-        return
-
-    if data == "cancel-booking":
-        _clear_flow(context)
-        await query.edit_message_text("Booking cancelled. No appointment was created.")
         return
 
     if data.startswith("toggle:"):
@@ -2851,6 +2797,16 @@ async def _error(update, context):
 _cancel_patch_installed = False
 
 
+def _is_main_menu_markup(markup) -> bool:
+    if not isinstance(markup, ReplyKeyboardMarkup):
+        return False
+    menu_texts = {item for row in MENU for item in row}
+    keyboard_texts = {
+        button.text for row in markup.keyboard for button in row
+    }
+    return keyboard_texts == menu_texts
+
+
 def install_universal_cancel() -> None:
     """Attach the universal Cancel & Main Menu button to every bot reply."""
     global _cancel_patch_installed
@@ -2868,6 +2824,8 @@ def install_universal_cancel() -> None:
         if markup is None:
             kwargs["reply_markup"] = cancel_keyboard()
             return await original_reply(self, text, *args, **kwargs)
+        if _is_main_menu_markup(markup):
+            return await original_reply(self, text, *args, **kwargs)
         result = await original_reply(self, text, *args, **kwargs)
         try:
             await original_reply(self, CANCEL_LABEL, reply_markup=cancel_keyboard())
@@ -2882,6 +2840,8 @@ def install_universal_cancel() -> None:
             return await original_edit(self, text, *args, **kwargs)
         if markup is None:
             kwargs["reply_markup"] = cancel_keyboard()
+            return await original_edit(self, text, *args, **kwargs)
+        if _is_main_menu_markup(markup):
             return await original_edit(self, text, *args, **kwargs)
         result = await original_edit(self, text, *args, **kwargs)
         try:
