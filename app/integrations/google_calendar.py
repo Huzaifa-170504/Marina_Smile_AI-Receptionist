@@ -23,6 +23,10 @@ class CalendarWriteError(RuntimeError):
     """Raised when a Calendar event cannot be created or deleted."""
 
 
+class SyncTokenExpiredError(CalendarUnavailableError):
+    """Raised when Google Calendar rejects an incremental sync token."""
+
+
 class CalendarReader(Protocol):
     def list_busy_intervals(
         self,
@@ -107,6 +111,109 @@ class GoogleCalendarClient:
                 "Google Calendar credentials are unavailable"
             ) from exc
         return cls(AuthorizedSession(credentials), timeout_seconds)
+
+    def list_calendars(self) -> list[dict[str, object]]:
+        """Return the calendars visible to the authenticated account."""
+        url = "https://www.googleapis.com/calendar/v3/users/me/calendarList"
+        items: list[dict[str, object]] = []
+        page_token: str | None = None
+        try:
+            while True:
+                params: dict[str, object] = {"maxResults": 250}
+                if page_token:
+                    params["pageToken"] = page_token
+                response = self._session.get(
+                    url, params=params, timeout=self._timeout_seconds
+                )
+                response.raise_for_status()
+                payload = response.json()
+                items.extend(payload.get("items") or [])
+                page_token = payload.get("nextPageToken")
+                if not page_token:
+                    break
+        except Exception as exc:
+            raise CalendarUnavailableError(
+                "Google Calendar list could not be retrieved"
+            ) from exc
+        return items
+
+    def get_calendar(self, calendar_id: str) -> dict[str, object]:
+        if not calendar_id:
+            raise CalendarUnavailableError("Calendar ID is not configured")
+        url = (
+            "https://www.googleapis.com/calendar/v3/calendars/"
+            f"{quote(calendar_id, safe='')}"
+        )
+        try:
+            response = self._session.get(url, timeout=self._timeout_seconds)
+            response.raise_for_status()
+            return response.json()
+        except Exception as exc:
+            raise CalendarUnavailableError(
+                "Google Calendar metadata could not be retrieved"
+            ) from exc
+
+    def list_events(
+        self,
+        calendar_id: str,
+        *,
+        time_min: datetime | None = None,
+        time_max: datetime | None = None,
+        sync_token: str | None = None,
+        show_deleted: bool = False,
+        timezone_name: str = "Asia/Dubai",
+    ) -> tuple[list[dict[str, object]], str | None]:
+        """List events, optionally incrementally with a Google sync token."""
+        if not calendar_id:
+            raise CalendarUnavailableError("Calendar ID is not configured")
+        url = (
+            "https://www.googleapis.com/calendar/v3/calendars/"
+            f"{quote(calendar_id, safe='')}/events"
+        )
+        events: list[dict[str, object]] = []
+        next_sync_token: str | None = None
+        page_token: str | None = None
+        try:
+            while True:
+                params: dict[str, object] = {
+                    "maxResults": 2500,
+                    "singleEvents": "true",
+                    "timeZone": timezone_name,
+                }
+                if sync_token:
+                    params["syncToken"] = sync_token
+                    params["showDeleted"] = "true"
+                else:
+                    params["showDeleted"] = "true" if show_deleted else "false"
+                    if time_min is not None:
+                        params["timeMin"] = time_min.isoformat()
+                    if time_max is not None:
+                        params["timeMax"] = time_max.isoformat()
+                    params["orderBy"] = "startTime"
+                if page_token:
+                    params["pageToken"] = page_token
+
+                response = self._session.get(
+                    url, params=params, timeout=self._timeout_seconds
+                )
+                if response.status_code == 410 and sync_token:
+                    raise SyncTokenExpiredError(
+                        "Google Calendar sync token expired"
+                    )
+                response.raise_for_status()
+                payload = response.json()
+                events.extend(payload.get("items") or [])
+                page_token = payload.get("nextPageToken")
+                next_sync_token = payload.get("nextSyncToken") or next_sync_token
+                if not page_token:
+                    break
+        except SyncTokenExpiredError:
+            raise
+        except Exception as exc:
+            raise CalendarUnavailableError(
+                "Google Calendar events could not be retrieved"
+            ) from exc
+        return events, next_sync_token
 
     def list_busy_intervals(
         self,

@@ -1,6 +1,7 @@
+import asyncio
 import logging
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -18,6 +19,16 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     telegram_application = None
+    holiday_sync_task = None
+    app_settings = get_settings()
+    if app_settings.holiday_sync_enabled:
+        from app.operations.holiday_sync import run_holiday_sync_scheduler
+
+        holiday_sync_task = asyncio.create_task(run_holiday_sync_scheduler())
+        logger.info("UAE holiday sync scheduler started")
+    else:
+        logger.info("UAE holiday sync scheduler disabled")
+
     if os.getenv("TELEGRAM_BOT_TOKEN"):
         from app.telegram.bot import start_polling_bot, stop_polling_bot
 
@@ -31,6 +42,10 @@ async def lifespan(_app: FastAPI):
     try:
         yield
     finally:
+        if holiday_sync_task is not None:
+            holiday_sync_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await holiday_sync_task
         if telegram_application is not None:
             await stop_polling_bot(telegram_application)
 
