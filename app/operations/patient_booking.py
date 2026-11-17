@@ -33,6 +33,14 @@ class PatientBookingError(RuntimeError):
     """A patient-facing booking error with a safe, user-visible message."""
 
 
+class BookingSlotTakenError(PatientBookingError):
+    """The selected slot was taken by another patient before confirmation."""
+
+
+class DuplicateServiceBookingError(PatientBookingError):
+    """The patient already holds an active appointment for this service/doctor."""
+
+
 def normalize_name(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
 
@@ -329,6 +337,85 @@ def describe_active_booking(booking: dict) -> str:
     )
 
 
+def find_duplicate_active_service_booking(
+    clinic_id: str,
+    patient_id: str,
+    dentist_id: str,
+    service_ids: list[str],
+    *,
+    client: Client | None = None,
+) -> dict | None:
+    """Find an active booking for the same patient, service, and doctor."""
+    requested = {str(value) for value in service_ids if value}
+    if not requested:
+        return None
+    supabase = client or get_supabase_client()
+
+    appointments = (
+        supabase.table("appointments")
+        .select(
+            "id,appointment_reference,status,service_id,dentist_id,"
+            "appointment_services(service_id,service_name)"
+        )
+        .eq("clinic_id", clinic_id)
+        .eq("patient_id", patient_id)
+        .eq("dentist_id", dentist_id)
+        .in_("status", ["pending", "confirmed"])
+        .gte("end_at", datetime.now(timezone.utc).isoformat())
+        .execute()
+        .data
+        or []
+    )
+    for appointment in appointments:
+        lines = appointment.get("appointment_services") or []
+        for line in lines:
+            if str(line.get("service_id")) in requested:
+                return {
+                    "kind": "appointment",
+                    "id": appointment["id"],
+                    "reference": appointment.get("appointment_reference"),
+                    "service_name": line.get("service_name") or "this service",
+                }
+        if str(appointment.get("service_id")) in requested:
+            return {
+                "kind": "appointment",
+                "id": appointment["id"],
+                "reference": appointment.get("appointment_reference"),
+                "service_name": "this service",
+            }
+
+    requests = (
+        supabase.table("booking_requests")
+        .select(
+            "id,status,preferred_dentist_id,service_id,"
+            "booking_request_services(service_id,service_name)"
+        )
+        .eq("clinic_id", clinic_id)
+        .eq("patient_id", patient_id)
+        .eq("preferred_dentist_id", dentist_id)
+        .in_("status", list(ACTIVE_BOOKING_STATUSES))
+        .execute()
+        .data
+        or []
+    )
+    for request in requests:
+        lines = request.get("booking_request_services") or []
+        for line in lines:
+            if str(line.get("service_id")) in requested:
+                return {
+                    "kind": "request",
+                    "id": request["id"],
+                    "service_name": line.get("service_name") or "this service",
+                }
+        if str(request.get("service_id")) in requested:
+            return {
+                "kind": "request",
+                "id": request["id"],
+                "service_name": "this service",
+            }
+    return None
+
+
 def create_booking_request(
     *,
     clinic_id: str,
@@ -569,22 +656,38 @@ def finalize_booking_request(
     dentist_name = dentist_rows[0]["name"]
     service_names = ", ".join(line["service_name"] for line in services) or "Appointment"
 
-    reserved = (
-        supabase.rpc(
-            "reserve_appointment",
-            {
-                "p_clinic_id": clinic_id,
-                "p_booking_request_id": request["id"],
-                "p_payment_id": payment_id,
-                "p_dentist_id": request["preferred_dentist_id"],
-                "p_start_at": request["preferred_window_start"],
-                "p_end_at": request["preferred_window_end"],
-                "p_idempotency_key": request["id"],
-            },
+    try:
+        reserved = (
+            supabase.rpc(
+                "reserve_appointment",
+                {
+                    "p_clinic_id": clinic_id,
+                    "p_booking_request_id": request["id"],
+                    "p_payment_id": payment_id,
+                    "p_dentist_id": request["preferred_dentist_id"],
+                    "p_start_at": request["preferred_window_start"],
+                    "p_end_at": request["preferred_window_end"],
+                    "p_idempotency_key": request["id"],
+                },
+            )
+            .execute()
+            .data
         )
-        .execute()
-        .data
-    )
+    except APIError as exc:
+        error_text = " ".join(
+            value for value in (exc.message, exc.details, exc.hint) if value
+        ).casefold()
+        if exc.code == "23P01" or "overlap" in error_text or "conflicting key" in error_text:
+            raise BookingSlotTakenError(
+                "Sorry, this appointment slot has just been booked by another patient. "
+                "Please select another available slot."
+            ) from exc
+        if "already booked this service" in error_text:
+            raise DuplicateServiceBookingError(
+                "You have already booked this service with this doctor. "
+                "Please cancel your existing booking before making a new one."
+            ) from exc
+        raise
     appointment = _single_row(reserved)
     if appointment is None:
         return {
