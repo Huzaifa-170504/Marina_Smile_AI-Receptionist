@@ -139,12 +139,23 @@ The entire booking system uses **Asia/Dubai**:
 - Holiday dates are kept as UAE calendar dates and are not shifted by UTC conversion.
 - Server or user timezone never determines appointment availability.
 
+### Phone formats
+
+Patient lookup and registration normalize UAE and Pakistan numbers before
+matching, so local and international forms identify the same patient:
+
+- UAE: `+971 4 XXX XXXX` and `04 XXX XXXX`
+- UAE mobile: `+971 50 XXX XXXX` and `050 XXX XXXX`
+- Pakistan mobile: `+92 300 1234567` and `0300 1234567`
+- Email addresses are also accepted.
+
 ### Universal navigation
 
-Every bot reply carries an inline **❌ Cancel & Main Menu** button. Existing
-inline buttons are preserved and the cancel button is appended. `/cancel` and
-typing `cancel` remain available. Cancelling a workflow clears temporary state
-only; confirmed bookings are not changed.
+Each workflow reply carries exactly one **Cancel & Return to Main Menu** button. Local
+duplicate Cancel buttons were removed. The main menu itself has no Cancel
+button. Existing inline actions are preserved. `/cancel` and typing `cancel`
+remain available. Cancelling a workflow clears temporary state only; confirmed
+bookings are not changed.
 
 ### Notifications
 
@@ -459,7 +470,7 @@ npm.cmd run typecheck
 npm.cmd run build
 ```
 
-Current suites: **266 backend tests** and **27 dashboard tests**. Unit tests do
+Current suites: **270 backend tests** and **27 dashboard tests**. Unit tests do
 not prove hosted credentials, Calendar permissions, migrations, Telegram
 polling, or deployments work; verify those separately.
 

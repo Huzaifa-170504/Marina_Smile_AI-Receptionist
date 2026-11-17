@@ -3,7 +3,7 @@ from __future__ import annotations
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 
-CANCEL_LABEL = "❌ Cancel & Main Menu"
+CANCEL_LABEL = "Cancel & Return to Main Menu"
 CANCEL_CALLBACK = "main-menu"
 
 

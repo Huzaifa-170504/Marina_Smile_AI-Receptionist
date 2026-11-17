@@ -133,7 +133,7 @@ Never expose `SUPABASE_SECRET_KEY`, Gemini keys, Google private keys, or `DEMO_A
 
 ## Verification expectations
 
-- Python suite: 266 tests.
+- Python suite: 270 tests.
 - Dashboard suite: 27 tests across 10 files.
 - TypeScript must pass `npm run typecheck`.
 - Tests do not prove live Supabase constraints, Calendar permissions, migrations, Telegram polling, or Render/Vercel deploys. Verify those separately against the hosted services.
@@ -144,9 +144,9 @@ Do not weaken these when changing workflows:
 
 - **AI:** `app/ai/prompts.py` limits answers to Marina Smile, forbids inventing operational facts, diagnoses, prescriptions, dosages, outcome guarantees, credential/system-prompt disclosure, prompt injection, and false booking/payment claims. Gemini has no tool or SQL/shell execution.
 - **Medical:** `_is_emergency()` in `app/telegram/bot.py` intercepts difficulty breathing, difficulty swallowing, severe facial swelling, and uncontrolled bleeding before AI or booking and advises immediate emergency care.
-- **Identity/privacy:** patient lookups require the Telegram chat linked to the contact. `PatientSafeSupabase` blocks staff, payroll, refund, and audit tables. Cancellation anonymises identifiers and deletes receipt images. Do not log patient names, phones, or emails.
+- **Identity/privacy:** patient lookups require the Telegram chat linked to the contact. `PatientSafeSupabase` blocks staff, payroll, refund, and audit tables. Phone identifiers are canonicalized (`normalize_phone`) so UAE local/international (`04 XXX XXXX` / `+971 4 XXX XXXX`) and Pakistan (`0300 1234567` / `+92 300 1234567`) forms match the same contact. Cancellation anonymises identifiers and deletes receipt images. Do not log patient names, phones, or emails.
 - **Appointments:** booking dates are limited to today through 30 days ahead, weekdays only, and today's slots start at least one hour from now. Clinic hours are 10:00–18:00 with a 13:00–14:00 break; weekends and `clinic_holidays` dates are closed. These rules are enforced by the shared `clinic_hours` module and the `appointments_validate_clinic_hours` database trigger. Booking shows a full summary and requires an explicit **Confirm booking** callback; rescheduling shows a summary and requires **Confirm reschedule**. Database exclusion constraints, the advisory-locked duplicate service/doctor guard in `reserve_appointment`, and Calendar checks are authoritative. Never auto-cancel for a missed reminder.
-- **Universal navigation:** every bot reply gets the inline **❌ Cancel & Main Menu** button through `install_universal_cancel()` and `app/telegram/ui.py`; existing inline buttons are preserved. `/cancel` and typed `cancel` also clear temporary state without touching confirmed bookings.
+- **Universal navigation:** workflow replies get one inline **Cancel & Return to Main Menu** button through `install_universal_cancel()` and `app/telegram/ui.py`; the main menu itself is skipped. Local duplicate Cancel buttons were removed. Existing inline actions are preserved. `/cancel` and typed `cancel` also clear temporary state without touching confirmed bookings.
 - **Holidays:** Google Calendar is the primary holiday source. Synchronization never deletes rows on an empty response or API failure, uses a lease to prevent concurrent runs, stores event IDs/sync tokens, and falls back to a full sync on an expired token. Booking reads Supabase only, never the live holiday API.
 - **Payments:** screenshots stay `submitted` until staff verification. Cash settlement, approval, rejection, and refunds are staff-only RPCs. AI never modifies payments.
 - **Notifications:** database triggers own reminder scheduling, moving, and cancellation. The worker re-checks appointment status before sending, uses unique event keys, and retries delivery up to 3 times with a 5-minute delay. Delivery failure never changes an appointment. Reminder previews omit treatment names; full details stay in My Appointments. Messages are transactional, not marketing.

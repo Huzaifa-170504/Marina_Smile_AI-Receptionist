@@ -46,7 +46,23 @@ def normalize_name(value: str) -> str:
 
 
 def normalize_phone(value: str) -> str:
-    return re.sub(r"\D", "", value)
+    """Canonicalize UAE and Pakistan numbers to country-code digits.
+
+    UAE: 04 XXX XXXX -> 9714XXXXXXX, 050 XXX XXXX -> 97150XXXXXXX
+    Pakistan: 0300 1234567 -> 923001234567
+    """
+    digits = re.sub(r"\D", "", value or "")
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if not digits:
+        return ""
+    if digits.startswith("0"):
+        if len(digits) == 11 and digits[1] == "3":
+            return "92" + digits[1:]
+        if len(digits) in (9, 10):
+            return "971" + digits[1:]
+        return digits[1:]
+    return digits
 
 
 def phone_matches(left: str | None, right: str | None) -> bool:
@@ -281,60 +297,6 @@ def resolve_or_register_patient(
         "gender": patient.get("gender"),
         "telegram_chat_id": contact.get("telegram_chat_id") or telegram_chat_id,
     }
-
-
-def active_booking_for_patient(
-    clinic_id: str,
-    patient_id: str,
-    *,
-    client: Client | None = None,
-) -> dict | None:
-    """Return the patient's next unserved booking, if one exists."""
-    supabase = client or get_supabase_client()
-    now = _utc_now().isoformat()
-
-    requests = (
-        supabase.table("booking_requests")
-        .select("id,status,preferred_window_start,total_amount,currency,payment_mode,payment_status")
-        .eq("clinic_id", clinic_id)
-        .eq("patient_id", patient_id)
-        .in_("status", list(ACTIVE_BOOKING_STATUSES))
-        .execute()
-        .data
-        or []
-    )
-    if requests:
-        return {"kind": "request", "record": requests[0]}
-
-    appointments = (
-        supabase.table("appointments")
-        .select(
-            "id,appointment_reference,status,start_at,end_at,total_amount,currency,payment_mode,payment_status"
-        )
-        .eq("clinic_id", clinic_id)
-        .eq("patient_id", patient_id)
-        .in_("status", ["pending", "confirmed"])
-        .gte("end_at", now)
-        .order("start_at")
-        .limit(1)
-        .execute()
-        .data
-        or []
-    )
-    if appointments:
-        return {"kind": "appointment", "record": appointments[0]}
-    return None
-
-
-def describe_active_booking(booking: dict) -> str:
-    record = booking["record"]
-    when = record.get("preferred_window_start") or record.get("start_at")
-    when_text = when[:16].replace("T", " ") if when else "a scheduled time"
-    return (
-        f"You already have an unserved booking ({when_text}).\n"
-        "You cannot edit the selected services in an existing booking.\n"
-        "Open My Appointments to retry confirmation or cancel the existing booking, then book again."
-    )
 
 
 def find_duplicate_active_service_booking(
