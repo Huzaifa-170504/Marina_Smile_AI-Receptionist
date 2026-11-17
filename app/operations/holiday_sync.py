@@ -108,7 +108,7 @@ def build_holiday_rows(
     set[tuple[str, date]],
     date | None,
 ]:
-    rows: list[dict[str, Any]] = []
+    by_date: dict[date, dict[str, Any]] = {}
     active_ids: set[str] = set()
     cancelled_ids: set[str] = set()
     valid_pairs: set[tuple[str, date]] = set()
@@ -137,20 +137,33 @@ def build_holiday_rows(
                 updated_at = None
         for day in dates:
             valid_pairs.add((event_id, day))
-            rows.append(
-                {
+            bucket = by_date.get(day)
+            if bucket is None:
+                bucket = {
                     "clinic_id": clinic_id,
                     "holiday_date": day.isoformat(),
-                    "name": name,
                     "source": "google_calendar",
                     "google_event_id": event_id,
                     "calendar_id": calendar_id,
                     "last_synced_at": synced_at.isoformat(),
                     "event_updated_at": updated_at,
+                    "names": [],
                 }
-            )
+                by_date[day] = bucket
+            if name not in bucket["names"]:
+                bucket["names"].append(name)
+            bucket["google_event_id"] = event_id
+            if updated_at is not None:
+                bucket["event_updated_at"] = updated_at
             if max_date is None or day > max_date:
                 max_date = day
+
+    rows: list[dict[str, Any]] = []
+    for day in sorted(by_date):
+        bucket = by_date[day]
+        names = bucket.pop("names")
+        bucket["name"] = " / ".join(names)
+        rows.append(bucket)
     return rows, active_ids, cancelled_ids, valid_pairs, max_date
 
 

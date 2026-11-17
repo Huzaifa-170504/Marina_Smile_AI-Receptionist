@@ -179,6 +179,32 @@ def test_discovery_rejects_non_uae_calendar() -> None:
         discover_uae_holiday_calendar(calendar, "other")
 
 
+def test_duplicate_event_dates_are_merged_into_one_row() -> None:
+    events = [
+        {
+            "id": "eid-1",
+            "status": "confirmed",
+            "summary": "Eid Al-Adha",
+            "start": {"date": "2027-05-17"},
+            "end": {"date": "2027-05-18"},
+        },
+        {
+            "id": "eid-2",
+            "status": "confirmed",
+            "summary": "Eid Al-Adha Holiday",
+            "start": {"date": "2027-05-17"},
+            "end": {"date": "2027-05-18"},
+        },
+    ]
+    rows, _active, _cancelled, _pairs, _coverage = build_holiday_rows(
+        "clinic", UAE_CALENDAR, events, datetime(2027, 1, 1, tzinfo=timezone.utc)
+    )
+    assert len(rows) == 1
+    assert rows[0]["holiday_date"] == "2027-05-17"
+    assert "Eid Al-Adha" in rows[0]["name"]
+    assert "Eid Al-Adha Holiday" in rows[0]["name"]
+
+
 def test_build_rows_and_stale_detection_handle_modifications_and_cancellations() -> None:
     events = [
         {

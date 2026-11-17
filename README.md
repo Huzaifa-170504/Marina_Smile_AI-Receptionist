@@ -459,7 +459,7 @@ npm.cmd run typecheck
 npm.cmd run build
 ```
 
-Current suites: **265 backend tests** and **27 dashboard tests**. Unit tests do
+Current suites: **266 backend tests** and **27 dashboard tests**. Unit tests do
 not prove hosted credentials, Calendar permissions, migrations, Telegram
 polling, or deployments work; verify those separately.
 
