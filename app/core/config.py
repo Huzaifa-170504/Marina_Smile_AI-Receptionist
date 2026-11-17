@@ -67,6 +67,17 @@ class Settings(BaseSettings):
         default=None,
         alias="GOOGLE_APPLICATION_CREDENTIALS",
     )
+    uae_holiday_calendar_id: str = Field(
+        default="en.ae.official#holiday@group.v.calendar.google.com",
+        alias="UAE_HOLIDAY_CALENDAR_ID",
+    )
+    holiday_sync_enabled: bool = Field(default=True, alias="HOLIDAY_SYNC_ENABLED")
+    holiday_sync_interval_hours: int = Field(
+        default=6,
+        ge=1,
+        le=168,
+        alias="HOLIDAY_SYNC_INTERVAL_HOURS",
+    )
     dashboard_allowed_origins: str = Field(
         default="",
         alias="DASHBOARD_ALLOWED_ORIGINS",

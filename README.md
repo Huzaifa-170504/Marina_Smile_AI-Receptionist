@@ -96,57 +96,48 @@ staff dashboard.
 - Public holidays: closed.
 
 Operating hours, break times, and closed weekdays are stored on `clinics`.
-Public holidays are stored in `clinic_holidays` (`clinic_id`, `holiday_date`,
-optional `name`) and can be added or changed in SQL without code changes:
+Public holidays are stored in `clinic_holidays` and used by booking,
+rescheduling, and the database trigger.
 
-```sql
-insert into public.clinic_holidays (clinic_id, holiday_date, name)
-values ('<clinic-uuid>', '2026-12-02', 'Public holiday')
-on conflict (clinic_id, holiday_date) do update set name = excluded.name;
-```
+### Google Calendar holiday synchronization
 
-The same rules are enforced in Telegram date/slot selection, availability and
-rescheduling services, and a final database appointment trigger.
+Public holidays come from the existing Google Calendar service-account
+integration, not from a hand-maintained annual list.
 
-### Islamic holiday dates
+- The UAE public holiday calendar is discovered from `calendarList` when
+  available, otherwise the configured public calendar is used
+  (`UAE_HOLIDAY_CALENDAR_ID`, default
+  `en.ae.official#holiday@group.v.calendar.google.com`).
+- The integration currently uses a service account, so `calendarList` is empty;
+  the public UAE calendar is readable and was verified to return UAE holiday
+  events.
+- Event retrieval uses Google `events.list`, pagination, `singleEvents`, and
+  `Asia/Dubai` timezone handling. All-day events use their date fields directly.
+- Synchronized rows are upserted into `clinic_holidays` with source
+  `google_calendar`, the Google event ID, calendar ID, and event timestamps.
+- Incremental sync uses Google sync tokens; an expired token triggers a full
+  sync. Deleted events remove their synchronized rows.
+- Manual `clinic_holidays` rows are preserved. Google-sourced rows are replaced
+  only by a successful full response; an empty response or API outage never
+  deletes existing holidays.
+- Sync state, lease, last success, coverage end, and errors are stored in
+  `clinic_holiday_sync`. Concurrent schedulers are prevented with a lease.
+- The sync runs on startup and then every `HOLIDAY_SYNC_INTERVAL_HOURS`
+  (default 6). It can be disabled with `HOLIDAY_SYNC_ENABLED=false`.
 
-Islamic holidays move each Gregorian year. Generate provisional UAE holiday SQL
-from the Hijri rules for the target year:
+The connected calendar currently provides events through 2027; the sync window
+requests one year back and three years forward, and `coverage_end` reports the
+actual end of the source data rather than inventing dates.
 
-```powershell
-.\venv\Scripts\python.exe scripts/generate_uae_holidays.py `
-  --year 2027 `
-  --clinic-id <clinic-uuid> `
-  --output holidays_2027.sql
-```
+### Timezone standard
 
-The generator covers:
+The entire booking system uses **Asia/Dubai**:
 
-- New Year's Day and UAE National Day (fixed Gregorian dates)
-- Eid Al Fitr (1–3 Shawwal)
-- Arafah Day (9 Dhul Hijjah)
-- Eid Al Adha (10–12 Dhul Hijjah)
-- Islamic New Year (1 Muharram)
-- Prophet Muhammad's Birthday (12 Rabi' al-Awwal)
-
-Because actual dates depend on the UAE moon-sighting announcement, the output
-is **provisional**. Review it against the official announcement before running
-it. If the announced date differs, shift all Islamic dates:
-
-```powershell
-.\venv\Scripts\python.exe scripts/generate_uae_holidays.py `
-  --year 2027 --clinic-id <clinic-uuid> --adjust-days 1
-```
-
-Or adjust one holiday only:
-
-```powershell
---adjust eid_al_fitr=1
---adjust arafah=-1
-```
-
-Then run the generated SQL in Supabase. `clinic_holidays` remains the single
-source of truth used by booking, rescheduling, and the database trigger.
+- Date selection is based on the current UAE date.
+- Appointment slots, confirmations, My Appointments, and reminders display UAE time.
+- Google Calendar appointment events are created with the clinic's UAE timezone.
+- Holiday dates are kept as UAE calendar dates and are not shifted by UTC conversion.
+- Server or user timezone never determines appointment availability.
 
 ### Universal navigation
 
@@ -357,6 +348,9 @@ Open `http://localhost:3000` for the recruiter experience or
 | `DEFAULT_CLINIC_ID` | Fixed clinic scope for the bot and scripts |
 | `RAG_MATCH_THRESHOLD` | Minimum pgvector similarity accepted for knowledge context |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Service-account JSON path used for Calendar |
+| `UAE_HOLIDAY_CALENDAR_ID` | Public UAE holiday calendar fallback ID |
+| `HOLIDAY_SYNC_ENABLED` | Enables automatic holiday synchronization |
+| `HOLIDAY_SYNC_INTERVAL_HOURS` | Sync interval in hours (default 6) |
 | `DASHBOARD_ALLOWED_ORIGINS` | Comma-separated trusted frontend origins |
 | `DASHBOARD_APPLICATION_URL` | Origin used for Auth email redirects |
 | `AVAILABILITY_SEARCH_DAYS` | Number of days searched for live slots |
@@ -413,6 +407,7 @@ Recent additive migrations include:
 - `20261109190000_reminder_timing_rules.sql`
 - `20261117100000_booking_duplicate_guard.sql`
 - `20261117110000_clinic_hours_and_holidays.sql`
+- `20261117120000_google_holiday_sync.sql`
 
 `supabase/tests/README.md` describes the SQL integrity/RLS suite. It requires a
 disposable project and is not run by `pytest`.
@@ -440,9 +435,7 @@ python scripts/cancel_appointment.py --help
 ### Holiday calendar
 
 ```powershell
-python scripts/generate_uae_holidays.py --year 2027 --clinic-id <clinic-uuid>
-python scripts/generate_uae_holidays.py --year 2027 --clinic-id <clinic-uuid> --adjust-days 1
-python scripts/generate_uae_holidays.py --year 2027 --clinic-id <clinic-uuid> --adjust eid_al_fitr=1
+python scripts/sync_uae_holidays.py
 ```
 
 Mutation CLIs show a preview and require explicit confirmation. Availability is
@@ -466,7 +459,7 @@ npm.cmd run typecheck
 npm.cmd run build
 ```
 
-Current suites: **255 backend tests** and **27 dashboard tests**. Unit tests do
+Current suites: **265 backend tests** and **27 dashboard tests**. Unit tests do
 not prove hosted credentials, Calendar permissions, migrations, Telegram
 polling, or deployments work; verify those separately.
 

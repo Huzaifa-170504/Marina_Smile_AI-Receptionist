@@ -46,7 +46,7 @@ Operational CLIs (they print a preview and require confirmation for mutations):
 ./venv/Scripts/python.exe scripts/book_appointment.py --help
 ./venv/Scripts/python.exe scripts/reschedule_appointment.py --help
 ./venv/Scripts/python.exe scripts/cancel_appointment.py --help
-./venv/Scripts/python.exe scripts/generate_uae_holidays.py --year 2027 --clinic-id <clinic-uuid>
+./venv/Scripts/python.exe scripts/sync_uae_holidays.py
 ```
 
 `TELEGRAM_BOT_TOKEN` is optional. If set, `app.main` starts Telegram polling **and** the reminder worker inside the FastAPI lifespan. If unset, the API runs without either.
@@ -56,7 +56,7 @@ Operational CLIs (they print a preview and require confirmation for mutations):
 There is no Supabase CLI configuration in the repo. Migrations are applied **manually in the Supabase SQL editor**, in filename order. Each file wraps its work in `begin; ... commit;`.
 
 - Files `0001`–`0016` are the canonical base.
-- Timestamped files (`20261020…`, `20261106…`, `20261109…`, `20261117…`) are additive releases. Recent additions cover per-service schedules, live patient-identity reconciliation, booking-plan cancellation, the legacy payment-gate removal, privacy cleanup, notification scheduling, reminder timing, multi-contact Telegram linking, the booking duplicate guard, and clinic hours/holidays. Never edit a migration that has already been applied; add a new timestamped file.
+- Timestamped files (`20261020…`, `20261106…`, `20261109…`, `20261117…`) are additive releases. Recent additions cover per-service schedules, live patient-identity reconciliation, booking-plan cancellation, the legacy payment-gate removal, privacy cleanup, notification scheduling, reminder timing, multi-contact Telegram linking, the booking duplicate guard, clinic hours/holidays, and Google holiday sync state. Never edit a migration that has already been applied; add a new timestamped file.
 - The live database may differ from the canonical files. Previous work hit live-only constraints (`patients_check` requiring DOB/age, `contacts.phone_number NOT NULL`). When a write fails with `23514` or `23502`, inspect the live constraint and reconcile it with a new migration rather than editing applied ones.
 - `supabase/tests/README.md` describes the SQL integrity/RLS suite; it requires a disposable project and is not run by `pytest`.
 
@@ -98,7 +98,9 @@ Important invariants:
 - Contact identity is unique per clinic for normalized phone and email. One Telegram chat may be linked to more than one contact (for example, family members), but the bot still refuses a second distinct patient under the same phone/email. Patient lookups only expose contacts linked to the current Telegram chat.
 - A patient may hold multiple active bookings for different services or doctors. `reserve_appointment` uses advisory locks plus a database check to reject a second active appointment for the **same service and doctor**; cancelled appointments release the service. The existing exclusion constraint prevents overlapping active appointments for the same dentist. Overdue never-checked-in visits are reconciled to `no_show`.
 - Clinic hours, break, closed weekdays, and public holidays are authoritative in the database. `clinics` stores operating hours (`open_time`, `close_time`, `break_start`, `break_end`, `closed_weekdays`); `clinic_holidays` stores dated closures. Python availability/services filter with `app/operations/clinic_hours.py`, and `appointments_validate_clinic_hours` rejects invalid inserts/updates for every interface.
-- Islamic holidays move each year. `scripts/generate_uae_holidays.py` converts the Hijri rules for a target year into provisional `clinic_holidays` SQL. Review against the official UAE announcement; use `--adjust-days N` or `--adjust key=N` (for example `eid_al_fitr=1`) for moon-sighting shifts. The generated SQL is the only write path; the table remains the source of truth.
+- Google Calendar is the primary holiday source. `app/operations/holiday_sync.py` discovers the UAE holiday calendar (calendarList first, then `UAE_HOLIDAY_CALENDAR_ID`), reads all-day events with `events.list`, and upserts `clinic_holidays` rows with `source='google_calendar'`, Google event IDs, calendar ID, and event timestamps. Incremental sync uses Google sync tokens; expired tokens fall back to a full sync. Deletions are applied only from successful responses; an empty full response or API outage never deletes existing holidays.
+- Sync state and a lease live in `clinic_holiday_sync`; `claim_holiday_sync` prevents concurrent schedulers. `app/main.py` starts `run_holiday_sync_scheduler()` on startup and repeats every `HOLIDAY_SYNC_INTERVAL_HOURS` (default 6). `HOLIDAY_SYNC_ENABLED=false` disables it. Manual runs use `scripts/sync_uae_holidays.py`.
+- The existing Google integration is a service account, not OAuth user tokens. `calendarList` is empty, but the public UAE holiday calendar is readable. If access fails, check calendar sharing/service-account credentials and `UAE_HOLIDAY_CALENDAR_ID`.
 - Appointment confirmation, rescheduling, cancellation, 24-hour/2-hour reminders, and post-completion feedback all use `outbound_notifications`. Database triggers own reminder scheduling and cancellation; the polling worker delivers due rows and re-checks appointment status before sending.
 
 ### Dashboard (`dashboard/`)
@@ -111,6 +113,16 @@ Important invariants:
 - Most appointment/booking controls are intentionally read-only; do not assume the UI exposes every backend operation.
 - `dashboard/AGENTS.md` is generated by `next dev` and warns that this Next.js version may differ from model training data. Read `dashboard/node_modules/next/dist/docs/` before writing Next.js code.
 
+## Timezone standard
+
+All scheduling is interpreted in **Asia/Dubai**, regardless of server or user timezone.
+
+- `clinics.timezone` is `Asia/Dubai`; appointment/slot/date calculations use `ZoneInfo(clinic.timezone)`.
+- Date selection, slot generation, rescheduling, cancellation, My Appointments, reminders, and Google appointment events use the clinic timezone.
+- Holiday sync uses `UAE_TIMEZONE = "Asia/Dubai"`; all-day holiday events keep their date fields without UTC conversion.
+- Timestamps are stored as `timestamptz`; date-only values remain UAE calendar dates.
+- Never introduce naive `datetime.now()` or server-local date calculations in booking paths.
+
 ## Environment
 
 Backend `.env` (see `.env.example`): `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, `GEMINI_API_KEY`, `DEFAULT_CLINIC_ID`, `TELEGRAM_BOT_TOKEN`, `GOOGLE_APPLICATION_CREDENTIALS`, `DASHBOARD_ALLOWED_ORIGINS`, demo settings.
@@ -121,7 +133,7 @@ Never expose `SUPABASE_SECRET_KEY`, Gemini keys, Google private keys, or `DEMO_A
 
 ## Verification expectations
 
-- Python suite: 255 tests.
+- Python suite: 265 tests.
 - Dashboard suite: 27 tests across 10 files.
 - TypeScript must pass `npm run typecheck`.
 - Tests do not prove live Supabase constraints, Calendar permissions, migrations, Telegram polling, or Render/Vercel deploys. Verify those separately against the hosted services.
@@ -135,6 +147,7 @@ Do not weaken these when changing workflows:
 - **Identity/privacy:** patient lookups require the Telegram chat linked to the contact. `PatientSafeSupabase` blocks staff, payroll, refund, and audit tables. Cancellation anonymises identifiers and deletes receipt images. Do not log patient names, phones, or emails.
 - **Appointments:** booking dates are limited to today through 30 days ahead, weekdays only, and today's slots start at least one hour from now. Clinic hours are 10:00–18:00 with a 13:00–14:00 break; weekends and `clinic_holidays` dates are closed. These rules are enforced by the shared `clinic_hours` module and the `appointments_validate_clinic_hours` database trigger. Booking shows a full summary and requires an explicit **Confirm booking** callback; rescheduling shows a summary and requires **Confirm reschedule**. Database exclusion constraints, the advisory-locked duplicate service/doctor guard in `reserve_appointment`, and Calendar checks are authoritative. Never auto-cancel for a missed reminder.
 - **Universal navigation:** every bot reply gets the inline **❌ Cancel & Main Menu** button through `install_universal_cancel()` and `app/telegram/ui.py`; existing inline buttons are preserved. `/cancel` and typed `cancel` also clear temporary state without touching confirmed bookings.
+- **Holidays:** Google Calendar is the primary holiday source. Synchronization never deletes rows on an empty response or API failure, uses a lease to prevent concurrent runs, stores event IDs/sync tokens, and falls back to a full sync on an expired token. Booking reads Supabase only, never the live holiday API.
 - **Payments:** screenshots stay `submitted` until staff verification. Cash settlement, approval, rejection, and refunds are staff-only RPCs. AI never modifies payments.
 - **Notifications:** database triggers own reminder scheduling, moving, and cancellation. The worker re-checks appointment status before sending, uses unique event keys, and retries delivery up to 3 times with a 5-minute delay. Delivery failure never changes an appointment. Reminder previews omit treatment names; full details stay in My Appointments. Messages are transactional, not marketing.
 - **Security/reliability:** per-chat rate limiting for messages and callbacks; Google Calendar timeouts; booking compensation; FastAPI/Pydantic input validation; HTTPS in hosted environments; structured logs for failed bookings, duplicate attempts, rejected lookups, notification failures, and AI fallbacks. The bot uses polling, not a webhook, so there is no webhook endpoint to validate.
