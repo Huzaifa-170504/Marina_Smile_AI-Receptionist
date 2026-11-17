@@ -11,6 +11,7 @@ from supabase import Client
 # refund, or internal records.
 PATIENT_SAFE_TABLES = frozenset({
     "clinics",
+    "clinic_holidays",
     "services",
     "dentists",
     "dentist_services",

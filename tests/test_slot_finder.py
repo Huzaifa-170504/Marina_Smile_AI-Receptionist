@@ -75,6 +75,11 @@ def configured_finder(monkeypatch: pytest.MonkeyPatch) -> None:
             name="Marina Smile",
             timezone="Asia/Dubai",
             google_calendar_id="calendar@example.com",
+            open_time=time(9, 0),
+            close_time=time(18, 0),
+            break_start=None,
+            break_end=None,
+            closed_weekdays=[],
         ),
     )
     monkeypatch.setattr(

@@ -46,6 +46,7 @@ Operational CLIs (they print a preview and require confirmation for mutations):
 ./venv/Scripts/python.exe scripts/book_appointment.py --help
 ./venv/Scripts/python.exe scripts/reschedule_appointment.py --help
 ./venv/Scripts/python.exe scripts/cancel_appointment.py --help
+./venv/Scripts/python.exe scripts/generate_uae_holidays.py --year 2027 --clinic-id <clinic-uuid>
 ```
 
 `TELEGRAM_BOT_TOKEN` is optional. If set, `app.main` starts Telegram polling **and** the reminder worker inside the FastAPI lifespan. If unset, the API runs without either.
@@ -55,7 +56,7 @@ Operational CLIs (they print a preview and require confirmation for mutations):
 There is no Supabase CLI configuration in the repo. Migrations are applied **manually in the Supabase SQL editor**, in filename order. Each file wraps its work in `begin; ... commit;`.
 
 - Files `0001`–`0016` are the canonical base.
-- Timestamped files (`20261020…`, `20261106…`, `20261109…`, `20261117…`) are additive releases. Recent additions cover per-service schedules, live patient-identity reconciliation, booking-plan cancellation, the legacy payment-gate removal, privacy cleanup, notification scheduling, reminder timing, multi-contact Telegram linking, and the booking duplicate guard. Never edit a migration that has already been applied; add a new timestamped file.
+- Timestamped files (`20261020…`, `20261106…`, `20261109…`, `20261117…`) are additive releases. Recent additions cover per-service schedules, live patient-identity reconciliation, booking-plan cancellation, the legacy payment-gate removal, privacy cleanup, notification scheduling, reminder timing, multi-contact Telegram linking, the booking duplicate guard, and clinic hours/holidays. Never edit a migration that has already been applied; add a new timestamped file.
 - The live database may differ from the canonical files. Previous work hit live-only constraints (`patients_check` requiring DOB/age, `contacts.phone_number NOT NULL`). When a write fails with `23514` or `23502`, inspect the live constraint and reconcile it with a new migration rather than editing applied ones.
 - `supabase/tests/README.md` describes the SQL integrity/RLS suite; it requires a disposable project and is not run by `pytest`.
 
@@ -70,7 +71,7 @@ There is no Supabase CLI configuration in the repo. Migrations are applied **man
   - **Typed pipeline**: `booking.py`, `reschedule.py`, `cancellation.py`, `availability.py`, `slot_finder.py`. Used by scripts and the operational tools. It validates schedules, DB conflicts, and Calendar, then creates `pending -> confirmed` appointments.
   - **Telegram request pipeline**: `patient_booking.py` + `app/telegram/bot.py`. Creates `booking_requests`, then `reserve_appointment` / `confirm_appointment_reservation` RPCs. This is the live patient flow and supports multi-service bookings with per-service doctor/time rows in `booking_request_services` and `appointment_services`.
 - `app/telegram/bot.py` — the patient state machine. Persistent menu: Book Appointment, My Appointments, Our Doctors, Dental Services, Ask Marina AI, Payments & Pricing, Help & Contact Reception.
-  - `Book Appointment`: phone/email -> multi-service selection -> doctor eligible for all services -> date selection (today through 30 days, buttons or manual `YYYY-MM-DD`) -> live slots for that date/doctor/duration (today starts at now + 1 hour) -> slot selection -> name/age/gender for new or incomplete patients -> review -> explicit cash-only confirmation with reference, patient ID, age, gender, doctor, services, and time.
+  - `Book Appointment`: phone/email -> multi-service selection -> doctor eligible for all services -> date selection (today through 30 days, weekdays only, buttons or manual `YYYY-MM-DD`) -> live slots for that date/doctor/duration (today starts at now + 1 hour, clinic hours 10:00–18:00, break 13:00–14:00, weekends/holidays excluded) -> slot selection -> name/age/gender for new or incomplete patients -> review -> explicit cash-only confirmation with reference, patient ID, age, gender, doctor, services, and time.
   - `My Appointments`, payment history, and payment status: ask only for the booking phone/email, then show the patient's name, age, gender and all grouped upcoming/past/cancelled appointments. Reschedule lists live slots immediately.
   - Appointment actions: view details, reschedule (wired to `reschedule_appointment` with multi-service duration/service overrides), cancel one appointment, or cancel all active appointments. Cancellation updates the database before replying and offers a refreshed list.
   - `Our Doctors`, `Dental Services`, `Ask Marina AI`, `Payments & Pricing` (prices, methods, history, payment status, refund guidance), `Help & Contact Reception`.
@@ -96,6 +97,8 @@ Important invariants:
   - `online`: receipt is uploaded to `payment-proofs`; `verify_payment` marks the request `payment_verified`, and the API then finalizes the appointment.
 - Contact identity is unique per clinic for normalized phone and email. One Telegram chat may be linked to more than one contact (for example, family members), but the bot still refuses a second distinct patient under the same phone/email. Patient lookups only expose contacts linked to the current Telegram chat.
 - A patient may hold multiple active bookings for different services or doctors. `reserve_appointment` uses advisory locks plus a database check to reject a second active appointment for the **same service and doctor**; cancelled appointments release the service. The existing exclusion constraint prevents overlapping active appointments for the same dentist. Overdue never-checked-in visits are reconciled to `no_show`.
+- Clinic hours, break, closed weekdays, and public holidays are authoritative in the database. `clinics` stores operating hours (`open_time`, `close_time`, `break_start`, `break_end`, `closed_weekdays`); `clinic_holidays` stores dated closures. Python availability/services filter with `app/operations/clinic_hours.py`, and `appointments_validate_clinic_hours` rejects invalid inserts/updates for every interface.
+- Islamic holidays move each year. `scripts/generate_uae_holidays.py` converts the Hijri rules for a target year into provisional `clinic_holidays` SQL. Review against the official UAE announcement; use `--adjust-days N` or `--adjust key=N` (for example `eid_al_fitr=1`) for moon-sighting shifts. The generated SQL is the only write path; the table remains the source of truth.
 - Appointment confirmation, rescheduling, cancellation, 24-hour/2-hour reminders, and post-completion feedback all use `outbound_notifications`. Database triggers own reminder scheduling and cancellation; the polling worker delivers due rows and re-checks appointment status before sending.
 
 ### Dashboard (`dashboard/`)
@@ -118,7 +121,7 @@ Never expose `SUPABASE_SECRET_KEY`, Gemini keys, Google private keys, or `DEMO_A
 
 ## Verification expectations
 
-- Python suite: 247 tests.
+- Python suite: 255 tests.
 - Dashboard suite: 27 tests across 10 files.
 - TypeScript must pass `npm run typecheck`.
 - Tests do not prove live Supabase constraints, Calendar permissions, migrations, Telegram polling, or Render/Vercel deploys. Verify those separately against the hosted services.
@@ -130,7 +133,8 @@ Do not weaken these when changing workflows:
 - **AI:** `app/ai/prompts.py` limits answers to Marina Smile, forbids inventing operational facts, diagnoses, prescriptions, dosages, outcome guarantees, credential/system-prompt disclosure, prompt injection, and false booking/payment claims. Gemini has no tool or SQL/shell execution.
 - **Medical:** `_is_emergency()` in `app/telegram/bot.py` intercepts difficulty breathing, difficulty swallowing, severe facial swelling, and uncontrolled bleeding before AI or booking and advises immediate emergency care.
 - **Identity/privacy:** patient lookups require the Telegram chat linked to the contact. `PatientSafeSupabase` blocks staff, payroll, refund, and audit tables. Cancellation anonymises identifiers and deletes receipt images. Do not log patient names, phones, or emails.
-- **Appointments:** booking dates are limited to today through 30 days ahead, and today's slots start at least one hour from now. Booking shows a full summary and requires an explicit **Confirm booking** callback; rescheduling shows a summary and requires **Confirm reschedule**. Database exclusion constraints, the advisory-locked duplicate service/doctor guard in `reserve_appointment`, and Calendar checks are authoritative. Never auto-cancel for a missed reminder.
+- **Appointments:** booking dates are limited to today through 30 days ahead, weekdays only, and today's slots start at least one hour from now. Clinic hours are 10:00–18:00 with a 13:00–14:00 break; weekends and `clinic_holidays` dates are closed. These rules are enforced by the shared `clinic_hours` module and the `appointments_validate_clinic_hours` database trigger. Booking shows a full summary and requires an explicit **Confirm booking** callback; rescheduling shows a summary and requires **Confirm reschedule**. Database exclusion constraints, the advisory-locked duplicate service/doctor guard in `reserve_appointment`, and Calendar checks are authoritative. Never auto-cancel for a missed reminder.
+- **Universal navigation:** every bot reply gets the inline **❌ Cancel & Main Menu** button through `install_universal_cancel()` and `app/telegram/ui.py`; existing inline buttons are preserved. `/cancel` and typed `cancel` also clear temporary state without touching confirmed bookings.
 - **Payments:** screenshots stay `submitted` until staff verification. Cash settlement, approval, rejection, and refunds are staff-only RPCs. AI never modifies payments.
 - **Notifications:** database triggers own reminder scheduling, moving, and cancellation. The worker re-checks appointment status before sending, uses unique event keys, and retries delivery up to 3 times with a 5-minute delay. Delivery failure never changes an appointment. Reminder previews omit treatment names; full details stay in My Appointments. Messages are transactional, not marketing.
 - **Security/reliability:** per-chat rate limiting for messages and callbacks; Google Calendar timeouts; booking compensation; FastAPI/Pydantic input validation; HTTPS in hosted environments; structured logs for failed bookings, duplicate attempts, rejected lookups, notification failures, and AI fallbacks. The bot uses polling, not a webhook, so there is no webhook endpoint to validate.

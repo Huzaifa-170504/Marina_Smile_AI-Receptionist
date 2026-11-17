@@ -13,7 +13,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup, Update
 from telegram.ext import Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from app.ai.knowledge_answer import answer_knowledge_question
@@ -22,6 +22,11 @@ from app.database.supabase import get_supabase_client
 from app.operations.appointment_change_models import AppointmentActor, AppointmentActorType
 from app.operations.cancellation import cancel_appointment
 from app.operations import appointment_notifications
+from app.operations.clinic_hours import (
+    appointment_time_error,
+    clinic_date_error,
+    get_clinic_holidays,
+)
 from app.operations.patient_handoff import create_reception_handoff
 from app.operations.patient_booking import (
     BookingSlotTakenError,
@@ -40,6 +45,7 @@ from app.repositories.clinics import get_active_clinic
 from app.repositories.dentists import filter_dentists_for_service, list_active_dentists
 from app.telegram.notifications import run_notification_worker
 from app.telegram.privacy import PatientSafeSupabase
+from app.telegram.ui import CANCEL_LABEL, append_cancel, cancel_button, cancel_keyboard
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -112,7 +118,7 @@ def _menu():
 
 
 def _main_menu_row():
-    return [InlineKeyboardButton("🏠 Main menu", callback_data="main-menu")]
+    return [cancel_button()]
 
 
 def _client():
@@ -232,6 +238,7 @@ def _clear_flow(context):
         "reschedule_choice",
         "confirm_lock",
         "booking_date",
+        "booking_holidays",
         "slots",
         "request_id",
         "cancel_status",
@@ -634,6 +641,24 @@ async def _confirm_selected_booking(message, context):
             "The selected services expired. Please start again.", reply_markup=_menu()
         )
         return
+    try:
+        clinic = await asyncio.to_thread(get_active_clinic, _clinic_id())
+        holidays = await _booking_holiday_dates(clinic, context)
+        time_error = appointment_time_error(clinic, start_at, end_at, holidays)
+    except Exception:
+        logger.exception("Telegram clinic hours validation failed")
+        await message.reply_text(
+            "I couldn't validate the appointment time. Please try again."
+        )
+        return
+    if time_error is not None:
+        context.user_data.get("booking", {}).pop("slot", None)
+        await message.reply_text(
+            time_error,
+            reply_markup=_date_keyboard(clinic, holidays),
+        )
+        return
+
     try:
         duplicate = await asyncio.to_thread(
             find_duplicate_active_service_booking,
@@ -1583,7 +1608,17 @@ async def _callbacks(update, context):
         if chosen < today or chosen > last:
             await query.edit_message_text(
                 f"Please choose a date between today and {last:%d %b %Y}.",
-                reply_markup=_date_keyboard(clinic),
+                reply_markup=_date_keyboard(
+                    clinic, await _booking_holiday_dates(clinic, context)
+                ),
+            )
+            return
+        holidays = await _booking_holiday_dates(clinic, context)
+        date_error = clinic_date_error(clinic, chosen, holidays)
+        if date_error is not None:
+            await query.edit_message_text(
+                date_error,
+                reply_markup=_date_keyboard(clinic, holidays),
             )
             return
         booking = context.user_data.get("booking") or {}
@@ -1620,23 +1655,53 @@ def _booking_date_limits(clinic) -> tuple[date, date]:
     return today, today + timedelta(days=30)
 
 
-def _date_keyboard(clinic) -> InlineKeyboardMarkup:
+def _date_keyboard(
+    clinic,
+    holidays: set[date] | None = None,
+) -> InlineKeyboardMarkup:
     today, last = _booking_date_limits(clinic)
+    holidays = holidays or set()
     rows = []
     row = []
     current = today
     while current <= last:
-        label = "Today" if current == today else current.strftime("%a %d %b")
-        row.append(InlineKeyboardButton(label, callback_data=f"bdate:{current.isoformat()}"))
-        if len(row) == 3:
-            rows.append(row)
-            row = []
+        if (
+            current.isoweekday() not in clinic.closed_weekdays
+            and current not in holidays
+        ):
+            label = "Today" if current == today else current.strftime("%a %d %b")
+            row.append(
+                InlineKeyboardButton(
+                    label, callback_data=f"bdate:{current.isoformat()}"
+                )
+            )
+            if len(row) == 3:
+                rows.append(row)
+                row = []
         current += timedelta(days=1)
     if row:
         rows.append(row)
     rows.append([InlineKeyboardButton("Enter date manually", callback_data="bdate-manual")])
     rows.append(_main_menu_row())
     return InlineKeyboardMarkup(rows)
+
+
+async def _booking_holiday_dates(clinic, context) -> set[date]:
+    cached = context.user_data.get("booking_holidays")
+    if cached is not None:
+        return {date.fromisoformat(value) for value in cached}
+    today, last = _booking_date_limits(clinic)
+    holidays = await asyncio.to_thread(
+        get_clinic_holidays,
+        _clinic_id(),
+        today,
+        last,
+        client=_client(),
+    )
+    context.user_data["booking_holidays"] = sorted(
+        value.isoformat() for value in holidays
+    )
+    return holidays
 
 
 async def _show_booking_date_menu(update_or_query, context):
@@ -1653,11 +1718,12 @@ async def _show_booking_date_menu(update_or_query, context):
         await message.edit_text("Booking is temporarily unavailable.")
         return
     today, last = _booking_date_limits(clinic)
+    holidays = await _booking_holiday_dates(clinic, context)
     doctor = (booking.get("dentists") or {}).get(booking.get("dentist_id")) or "the doctor"
     await message.edit_text(
         f"Choose an appointment date for {doctor}. You can book from today "
-        f"({today:%d %b %Y}) through {last:%d %b %Y}.",
-        reply_markup=_date_keyboard(clinic),
+        f"({today:%d %b %Y}) through {last:%d %b %Y} (weekdays only).",
+        reply_markup=_date_keyboard(clinic, holidays),
     )
 
 
@@ -1683,11 +1749,25 @@ async def _show_booking_slots_for_date(message, context, *, edit: bool):
     try:
         clinic = await asyncio.to_thread(get_active_clinic, _clinic_id())
         today, last = _booking_date_limits(clinic)
+        holidays = await _booking_holiday_dates(clinic, context)
         if chosen < today or chosen > last:
             await message.reply_text(
                 f"Please choose a date between today and {last:%d %b %Y}.",
-                reply_markup=_date_keyboard(clinic),
+                reply_markup=_date_keyboard(clinic, holidays),
             )
+            return
+        date_error = clinic_date_error(clinic, chosen, holidays)
+        if date_error is not None:
+            if edit:
+                await message.edit_text(
+                    date_error,
+                    reply_markup=_date_keyboard(clinic, holidays),
+                )
+            else:
+                await message.reply_text(
+                    date_error,
+                    reply_markup=_date_keyboard(clinic, holidays),
+                )
             return
         timezone = ZoneInfo(clinic.timezone)
         day_start = datetime.combine(chosen, time.min, tzinfo=timezone)
@@ -1702,9 +1782,13 @@ async def _show_booking_slots_for_date(message, context, *, edit: bool):
                 "Please select another date."
             )
             if edit:
-                await message.edit_text(text, reply_markup=_date_keyboard(clinic))
+                await message.edit_text(
+                    text, reply_markup=_date_keyboard(clinic, holidays)
+                )
             else:
-                await message.reply_text(text, reply_markup=_date_keyboard(clinic))
+                await message.reply_text(
+                    text, reply_markup=_date_keyboard(clinic, holidays)
+                )
             return
 
         if edit:
@@ -1783,9 +1867,13 @@ async def _show_booking_slots_for_date(message, context, *, edit: bool):
             "Please select another date."
         )
         if edit:
-            await message.edit_text(text, reply_markup=_date_keyboard(clinic))
+            await message.edit_text(
+                text, reply_markup=_date_keyboard(clinic, holidays)
+            )
         else:
-            await message.reply_text(text, reply_markup=_date_keyboard(clinic))
+            await message.reply_text(
+                text, reply_markup=_date_keyboard(clinic, holidays)
+            )
         return
 
     freed_starts: set[datetime] = set()
@@ -1849,9 +1937,19 @@ async def _verify_booking_date_input(update, context):
         await update.effective_message.reply_text("Booking is temporarily unavailable.")
         return
     today, last = _booking_date_limits(clinic)
+    holidays = await _booking_holiday_dates(clinic, context)
     if chosen < today or chosen > last:
         await update.effective_message.reply_text(
-            f"Please choose a date between today and {last:%d %b %Y}."
+            f"Please choose a date between today and {last:%d %b %Y}.",
+            reply_markup=_date_keyboard(clinic, holidays),
+        )
+        return
+    date_error = clinic_date_error(clinic, chosen, holidays)
+    if date_error is not None:
+        context.user_data.pop(STATE, None)
+        await update.effective_message.reply_text(
+            date_error,
+            reply_markup=_date_keyboard(clinic, holidays),
         )
         return
     booking = context.user_data.get("booking") or {}
@@ -2740,11 +2838,67 @@ async def _media(update, context):
 
 async def _error(update, context):
     logger.error("Unhandled Telegram bot error", exc_info=context.error)
+    if update and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "Something went wrong. Please use /start or the Cancel button "
+                "to return to the main menu."
+            )
+        except Exception:
+            logger.exception("Failed to send Telegram error fallback")
+
+
+_cancel_patch_installed = False
+
+
+def install_universal_cancel() -> None:
+    """Attach the universal Cancel & Main Menu button to every bot reply."""
+    global _cancel_patch_installed
+    if _cancel_patch_installed:
+        return
+
+    original_reply = Message.reply_text
+    original_edit = Message.edit_text
+
+    async def patched_reply(self, text, *args, **kwargs):
+        markup = kwargs.get("reply_markup")
+        if isinstance(markup, InlineKeyboardMarkup):
+            kwargs["reply_markup"] = append_cancel(markup)
+            return await original_reply(self, text, *args, **kwargs)
+        if markup is None:
+            kwargs["reply_markup"] = cancel_keyboard()
+            return await original_reply(self, text, *args, **kwargs)
+        result = await original_reply(self, text, *args, **kwargs)
+        try:
+            await original_reply(self, CANCEL_LABEL, reply_markup=cancel_keyboard())
+        except Exception:
+            logger.exception("Failed to attach universal cancel button")
+        return result
+
+    async def patched_edit(self, text, *args, **kwargs):
+        markup = kwargs.get("reply_markup")
+        if isinstance(markup, InlineKeyboardMarkup):
+            kwargs["reply_markup"] = append_cancel(markup)
+            return await original_edit(self, text, *args, **kwargs)
+        if markup is None:
+            kwargs["reply_markup"] = cancel_keyboard()
+            return await original_edit(self, text, *args, **kwargs)
+        result = await original_edit(self, text, *args, **kwargs)
+        try:
+            await original_reply(self, CANCEL_LABEL, reply_markup=cancel_keyboard())
+        except Exception:
+            logger.exception("Failed to attach universal cancel button")
+        return result
+
+    Message.reply_text = patched_reply
+    Message.edit_text = patched_edit
+    _cancel_patch_installed = True
 
 
 def build_application():
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured.")
+    install_universal_cancel()
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel_command))

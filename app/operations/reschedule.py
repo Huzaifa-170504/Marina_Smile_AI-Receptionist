@@ -21,6 +21,7 @@ from app.operations.appointment_change_models import (
 )
 from app.operations.appointment_lifecycle import AppointmentStatus, can_transition
 from app.operations.availability import generate_candidate_starts, intervals_overlap
+from app.operations.clinic_hours import appointment_time_error, get_clinic_holidays
 from app.operations.booking_models import AppointmentRecord
 from app.operations.models import AvailabilitySearchResult, AvailabilityStatus
 from app.operations.slot_finder import find_available_slots
@@ -342,6 +343,27 @@ def _reschedule_appointment(
         )
     local_start = new_start_at.astimezone(timezone)
     new_end_at = local_start + timedelta(minutes=effective_duration)
+
+    holidays = get_clinic_holidays(
+        normalized_clinic_id,
+        local_start.date(),
+        local_start.date(),
+        client=supabase,
+    )
+    time_error = appointment_time_error(clinic, local_start, new_end_at, holidays)
+    if time_error is not None:
+        return _result(
+            RescheduleStatus.OUTSIDE_WORKING_HOURS,
+            appointment,
+            actor,
+            dentist_id=dentist.id,
+            dentist_name=dentist.name,
+            service_name=display_service_name,
+            new_start_at=local_start,
+            new_end_at=new_end_at,
+            reason=time_error,
+        )
+
     current = now or datetime.now(timezone)
     if current.tzinfo is None or local_start <= current.astimezone(timezone):
         return _result(

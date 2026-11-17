@@ -17,6 +17,10 @@ from app.operations.availability import (
     generate_candidate_starts,
     remove_conflicting_starts,
 )
+from app.operations.clinic_hours import (
+    get_clinic_holidays,
+    slot_within_clinic_hours,
+)
 from app.operations.date_parser import resolve_request_window
 from app.operations.intent_parser import IntentParsingError, parse_operational_request
 from app.operations.models import (
@@ -68,6 +72,12 @@ def find_available_slots(
     settings = get_settings()
     clinic = get_active_clinic(normalized_clinic_id, client=supabase)
     timezone = ZoneInfo(clinic.timezone)
+    holidays = get_clinic_holidays(
+        normalized_clinic_id,
+        window_start.astimezone(timezone).date(),
+        window_end.astimezone(timezone).date(),
+        client=supabase,
+    )
 
     dentists = list_active_dentists(normalized_clinic_id, client=supabase)
     if dentist_id is not None:
@@ -215,7 +225,13 @@ def find_available_slots(
                 )
             )
 
-    slots = [slot for slot in slots if slot.start_at >= window_start]
+    slots = [
+        slot
+        for slot in slots
+        if slot.start_at >= window_start
+        and slot_within_clinic_hours(clinic, slot.start_at, slot.end_at)
+        and slot.start_at.astimezone(timezone).date() not in holidays
+    ]
     slots.sort(key=lambda slot: (slot.start_at, slot.dentist_name.casefold()))
     selected_slots = slots[:limit]
     return AvailabilitySearchResult(
