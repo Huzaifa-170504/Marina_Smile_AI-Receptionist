@@ -108,6 +108,46 @@ on conflict (clinic_id, holiday_date) do update set name = excluded.name;
 The same rules are enforced in Telegram date/slot selection, availability and
 rescheduling services, and a final database appointment trigger.
 
+### Islamic holiday dates
+
+Islamic holidays move each Gregorian year. Generate provisional UAE holiday SQL
+from the Hijri rules for the target year:
+
+```powershell
+.\venv\Scripts\python.exe scripts/generate_uae_holidays.py `
+  --year 2027 `
+  --clinic-id <clinic-uuid> `
+  --output holidays_2027.sql
+```
+
+The generator covers:
+
+- New Year's Day and UAE National Day (fixed Gregorian dates)
+- Eid Al Fitr (1–3 Shawwal)
+- Arafah Day (9 Dhul Hijjah)
+- Eid Al Adha (10–12 Dhul Hijjah)
+- Islamic New Year (1 Muharram)
+- Prophet Muhammad's Birthday (12 Rabi' al-Awwal)
+
+Because actual dates depend on the UAE moon-sighting announcement, the output
+is **provisional**. Review it against the official announcement before running
+it. If the announced date differs, shift all Islamic dates:
+
+```powershell
+.\venv\Scripts\python.exe scripts/generate_uae_holidays.py `
+  --year 2027 --clinic-id <clinic-uuid> --adjust-days 1
+```
+
+Or adjust one holiday only:
+
+```powershell
+--adjust eid_al_fitr=1
+--adjust arafah=-1
+```
+
+Then run the generated SQL in Supabase. `clinic_holidays` remains the single
+source of truth used by booking, rescheduling, and the database trigger.
+
 ### Universal navigation
 
 Every bot reply carries an inline **❌ Cancel & Main Menu** button. Existing
@@ -397,6 +437,14 @@ python scripts/reschedule_appointment.py --help
 python scripts/cancel_appointment.py --help
 ```
 
+### Holiday calendar
+
+```powershell
+python scripts/generate_uae_holidays.py --year 2027 --clinic-id <clinic-uuid>
+python scripts/generate_uae_holidays.py --year 2027 --clinic-id <clinic-uuid> --adjust-days 1
+python scripts/generate_uae_holidays.py --year 2027 --clinic-id <clinic-uuid> --adjust eid_al_fitr=1
+```
+
 Mutation CLIs show a preview and require explicit confirmation. Availability is
 advisory; PostgreSQL remains the authoritative concurrency boundary.
 
@@ -418,7 +466,7 @@ npm.cmd run typecheck
 npm.cmd run build
 ```
 
-Current suites: **253 backend tests** and **27 dashboard tests**. Unit tests do
+Current suites: **255 backend tests** and **27 dashboard tests**. Unit tests do
 not prove hosted credentials, Calendar permissions, migrations, Telegram
 polling, or deployments work; verify those separately.
 

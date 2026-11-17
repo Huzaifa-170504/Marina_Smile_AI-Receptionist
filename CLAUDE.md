@@ -46,6 +46,7 @@ Operational CLIs (they print a preview and require confirmation for mutations):
 ./venv/Scripts/python.exe scripts/book_appointment.py --help
 ./venv/Scripts/python.exe scripts/reschedule_appointment.py --help
 ./venv/Scripts/python.exe scripts/cancel_appointment.py --help
+./venv/Scripts/python.exe scripts/generate_uae_holidays.py --year 2027 --clinic-id <clinic-uuid>
 ```
 
 `TELEGRAM_BOT_TOKEN` is optional. If set, `app.main` starts Telegram polling **and** the reminder worker inside the FastAPI lifespan. If unset, the API runs without either.
@@ -97,6 +98,7 @@ Important invariants:
 - Contact identity is unique per clinic for normalized phone and email. One Telegram chat may be linked to more than one contact (for example, family members), but the bot still refuses a second distinct patient under the same phone/email. Patient lookups only expose contacts linked to the current Telegram chat.
 - A patient may hold multiple active bookings for different services or doctors. `reserve_appointment` uses advisory locks plus a database check to reject a second active appointment for the **same service and doctor**; cancelled appointments release the service. The existing exclusion constraint prevents overlapping active appointments for the same dentist. Overdue never-checked-in visits are reconciled to `no_show`.
 - Clinic hours, break, closed weekdays, and public holidays are authoritative in the database. `clinics` stores operating hours (`open_time`, `close_time`, `break_start`, `break_end`, `closed_weekdays`); `clinic_holidays` stores dated closures. Python availability/services filter with `app/operations/clinic_hours.py`, and `appointments_validate_clinic_hours` rejects invalid inserts/updates for every interface.
+- Islamic holidays move each year. `scripts/generate_uae_holidays.py` converts the Hijri rules for a target year into provisional `clinic_holidays` SQL. Review against the official UAE announcement; use `--adjust-days N` or `--adjust key=N` (for example `eid_al_fitr=1`) for moon-sighting shifts. The generated SQL is the only write path; the table remains the source of truth.
 - Appointment confirmation, rescheduling, cancellation, 24-hour/2-hour reminders, and post-completion feedback all use `outbound_notifications`. Database triggers own reminder scheduling and cancellation; the polling worker delivers due rows and re-checks appointment status before sending.
 
 ### Dashboard (`dashboard/`)
@@ -119,7 +121,7 @@ Never expose `SUPABASE_SECRET_KEY`, Gemini keys, Google private keys, or `DEMO_A
 
 ## Verification expectations
 
-- Python suite: 253 tests.
+- Python suite: 255 tests.
 - Dashboard suite: 27 tests across 10 files.
 - TypeScript must pass `npm run typecheck`.
 - Tests do not prove live Supabase constraints, Calendar permissions, migrations, Telegram polling, or Render/Vercel deploys. Verify those separately against the hosted services.
