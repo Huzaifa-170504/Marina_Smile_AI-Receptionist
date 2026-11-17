@@ -24,11 +24,12 @@ from app.operations.cancellation import cancel_appointment
 from app.operations import appointment_notifications
 from app.operations.patient_handoff import create_reception_handoff
 from app.operations.patient_booking import (
+    BookingSlotTakenError,
+    DuplicateServiceBookingError,
     PatientBookingError,
-    active_booking_for_patient,
     create_booking_request,
-    describe_active_booking,
     finalize_booking_request,
+    find_duplicate_active_service_booking,
     lookup_identities,
     normalize_name,
     resolve_or_register_patient,
@@ -112,12 +113,6 @@ def _menu():
 
 def _main_menu_row():
     return [InlineKeyboardButton("🏠 Main menu", callback_data="main-menu")]
-
-
-def _appointments_shortcut():
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("Open My Appointments", callback_data="my-appointments")
-    ]])
 
 
 def _client():
@@ -210,6 +205,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                                    reply_markup=_menu())
 
 
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _private(update):
+        _clear_flow(context)
+        await update.effective_message.reply_text(
+            "Cancelled. You are back at the main menu.",
+            reply_markup=_menu(),
+        )
+
+
 def _clear_flow(context):
     for key in (
         STATE,
@@ -227,6 +231,7 @@ def _clear_flow(context):
         "reschedule_target",
         "reschedule_choice",
         "confirm_lock",
+        "booking_date",
         "slots",
         "request_id",
         "cancel_status",
@@ -360,27 +365,6 @@ async def _start_service_selection(update, context, patient, reply_message=None)
         or getattr(update, "message", None)
     )
     context.user_data["booking_patient"] = patient
-    if patient:
-        try:
-            existing = await asyncio.to_thread(
-                active_booking_for_patient, patient["clinic_id"], patient["patient_id"]
-            )
-        except Exception:
-            logger.exception("Telegram duplicate booking check failed")
-            await message.reply_text("I couldn't verify your bookings. Please try again.")
-            return
-        if existing:
-            logger.info(
-                "Duplicate active booking blocked",
-                extra={"patient_id": patient["patient_id"]},
-            )
-            _clear_flow(context)
-            context.user_data["lookup_patients"] = [patient]
-            await message.reply_text(
-                describe_active_booking(existing),
-                reply_markup=_appointments_shortcut(),
-            )
-            return
     try:
         services = await asyncio.to_thread(_load_service_rows, _clinic_id())
     except Exception:
@@ -595,6 +579,26 @@ def _booking_services_with_times(booking: dict) -> list[dict]:
     return rows
 
 
+def _cancel_booking_request(
+    booking_request_id: str,
+    expected_status: str = "awaiting_slot_selection",
+) -> None:
+    try:
+        _client().rpc(
+            "transition_booking_request",
+            {
+                "p_booking_request_id": booking_request_id,
+                "p_expected_status": expected_status,
+                "p_target_status": "cancelled",
+            },
+        ).execute()
+    except Exception:
+        logger.exception(
+            "Failed to cancel booking request after failed confirmation",
+            extra={"booking_request_id": booking_request_id},
+        )
+
+
 async def _confirm_selected_booking(message, context):
     booking = context.user_data.get("booking") or {}
     slot = booking.get("slot") or {}
@@ -623,26 +627,38 @@ async def _confirm_selected_booking(message, context):
             "I couldn't save your patient record. Please try later."
         )
         return
-    try:
-        existing = await asyncio.to_thread(
-            active_booking_for_patient, patient["clinic_id"], patient["patient_id"]
-        )
-    except Exception:
-        logger.exception("Telegram duplicate booking check failed")
-        existing = None
-    if existing:
-        _clear_flow(context)
-        context.user_data["lookup_patients"] = [patient]
-        await message.reply_text(
-            describe_active_booking(existing),
-            reply_markup=_appointments_shortcut(),
-        )
-        return
     services = _booking_services_with_times(booking)
     if not services:
         _clear_flow(context)
         await message.reply_text(
             "The selected services expired. Please start again.", reply_markup=_menu()
+        )
+        return
+    try:
+        duplicate = await asyncio.to_thread(
+            find_duplicate_active_service_booking,
+            patient["clinic_id"],
+            patient["patient_id"],
+            booking["dentist_id"],
+            [line["service_id"] for line in services],
+        )
+    except Exception:
+        logger.exception("Telegram duplicate service check failed")
+        await message.reply_text(
+            "I couldn't verify your existing bookings. Please try again."
+        )
+        return
+    if duplicate:
+        service_name = duplicate.get("service_name") or "this service"
+        context.user_data["lookup_patients"] = [patient]
+        await message.reply_text(
+            f"You have already booked {service_name} with this doctor. "
+            "Please cancel your existing booking before making a new one.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Choose another doctor", callback_data="back-doctors")],
+                [InlineKeyboardButton("Open My Appointments", callback_data="my-appointments")],
+                _main_menu_row(),
+            ]),
         )
         return
     try:
@@ -663,21 +679,52 @@ async def _confirm_selected_booking(message, context):
         logger.exception("Telegram booking request insert failed")
         await message.reply_text("I couldn't save the booking. Please try again.")
         return
+
     try:
         result = await asyncio.to_thread(
             finalize_booking_request, _clinic_id(), request["id"]
         )
+    except BookingSlotTakenError:
+        await asyncio.to_thread(_cancel_booking_request, request["id"])
+        context.user_data.get("booking", {}).pop("slot", None)
+        await message.reply_text(
+            "Sorry, this appointment slot has just been booked by another patient. "
+            "Please select another available slot."
+        )
+        await _show_booking_slots_for_date(message, context, edit=False)
+        return
+    except DuplicateServiceBookingError:
+        await asyncio.to_thread(_cancel_booking_request, request["id"])
+        context.user_data["lookup_patients"] = [patient]
+        await message.reply_text(
+            "You have already booked this service with this doctor. "
+            "Please cancel your existing booking before making a new one.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Choose another doctor", callback_data="back-doctors")],
+                [InlineKeyboardButton("Open My Appointments", callback_data="my-appointments")],
+                _main_menu_row(),
+            ]),
+        )
+        return
     except Exception:
         logger.exception(
             "Telegram cash booking confirmation failed",
             extra={"request_id": request["id"]},
         )
-        result = {}
+        await asyncio.to_thread(_cancel_booking_request, request["id"])
+        context.user_data.get("booking", {}).pop("slot", None)
+        await message.reply_text(
+            "I couldn't confirm the booking. Please select another available slot."
+        )
+        await _show_booking_slots_for_date(message, context, edit=False)
+        return
+
     text = await _booking_confirmation_text(patient, result, request, booking, services)
     await message.reply_text(text, reply_markup=_menu())
     context.user_data.pop("booking", None)
     context.user_data.pop("slot_profile", None)
     context.user_data.pop("slots", None)
+    context.user_data.pop("booking_date", None)
     context.user_data.pop(STATE, None)
 
 
@@ -1129,7 +1176,51 @@ async def _callbacks(update, context):
                 text += f"\n{note}"
         else:
             text = outcomes[0][2] if outcomes else "The appointment could not be cancelled."
-        await query.edit_message_text(text)
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Back to My Appointments", callback_data="my-appointments")
+            ]]),
+        )
+        return
+
+    if data == "cancel-all-appointments":
+        stored = list((context.user_data.get("appointments") or {}).values())
+        upcoming, _past, _cancelled = _appointment_state(stored)
+        if not upcoming:
+            await query.edit_message_text("No active appointments to cancel.")
+            return
+        await query.edit_message_text(
+            f"Cancel all {len(upcoming)} active appointment(s)? "
+            "This will release every selected slot and cannot be undone.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Yes, cancel all", callback_data="cancel-all-confirm")],
+                [InlineKeyboardButton("Back to My Appointments", callback_data="my-appointments")],
+            ]),
+        )
+        return
+
+    if data == "cancel-all-confirm":
+        stored = list((context.user_data.get("appointments") or {}).values())
+        upcoming, _past, _cancelled = _appointment_state(stored)
+        if not upcoming:
+            await query.edit_message_text("No active appointments to cancel.")
+            return
+        outcomes = await _cancel_stored_appointments(upcoming)
+        cancelled = sum(1 for _row, ok, _reason in outcomes if ok)
+        failures = [reason for _row, ok, reason in outcomes if not ok and reason]
+        notes = sorted({reason for _row, ok, reason in outcomes if ok and reason})
+        text = f"Cancelled {cancelled} of {len(upcoming)} active appointment(s)."
+        if notes:
+            text += "\n" + "\n".join(notes)
+        if failures:
+            text += "\n" + "\n".join(failures)
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Back to My Appointments", callback_data="my-appointments")
+            ]]),
+        )
         return
 
     if data.startswith("plan-cancel:"):
@@ -1409,16 +1500,96 @@ async def _callbacks(update, context):
         )
         return
 
+    if data == "back-doctors":
+        booking = context.user_data.get("booking") or {}
+        if booking.get("dentists"):
+            await query.edit_message_text(
+                "Choose an available doctor:",
+                reply_markup=_doctor_keyboard(booking),
+            )
+        return
+
     if data.startswith("doctor:"):
         booking = context.user_data.get("booking") or {}
         doctor_id = data.removeprefix("doctor:")
         if doctor_id not in booking.get("dentists", {}):
             await query.edit_message_text("That doctor selection expired. Please start booking again.")
             return
+        patient = context.user_data.get("booking_patient")
+        selected = list(booking.get("selected") or [])
+        if patient:
+            try:
+                duplicate = await asyncio.to_thread(
+                    find_duplicate_active_service_booking,
+                    _clinic_id(),
+                    patient["patient_id"],
+                    doctor_id,
+                    selected,
+                )
+            except Exception:
+                logger.exception("Telegram duplicate service check failed")
+                await query.edit_message_text(
+                    "I couldn't verify your existing bookings. Please try again."
+                )
+                return
+            if duplicate:
+                logger.info(
+                    "Duplicate service booking blocked",
+                    extra={"patient_id": patient["patient_id"]},
+                )
+                service_name = duplicate.get("service_name") or "this service"
+                await query.edit_message_text(
+                    f"You have already booked {service_name} with this doctor. "
+                    "Please cancel your existing booking before making a new one.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("Choose another doctor", callback_data="back-doctors")],
+                        [InlineKeyboardButton("Open My Appointments", callback_data="my-appointments")],
+                        _main_menu_row(),
+                    ]),
+                )
+                return
         booking["dentist_id"] = doctor_id
-        booking["service_order"] = list(booking.get("selected") or [])
+        booking["service_order"] = selected
         context.user_data.pop(STATE, None)
-        await _show_booking_slots(query, context)
+        context.user_data["lookup_patients"] = [patient] if patient else []
+        await _show_booking_date_menu(query, context)
+        return
+
+    if data == "bdate-menu":
+        await _show_booking_date_menu(query, context)
+        return
+
+    if data == "bdate-manual":
+        context.user_data[STATE] = "booking_date_input"
+        await query.edit_message_text(
+            "Send the appointment date as YYYY-MM-DD. It must be today or within the next 30 days."
+        )
+        return
+
+    if data.startswith("bdate:"):
+        value = data.removeprefix("bdate:")
+        try:
+            chosen = date.fromisoformat(value)
+        except ValueError:
+            await query.edit_message_text("That date is invalid. Please choose a date from the list.")
+            return
+        try:
+            clinic = await asyncio.to_thread(get_active_clinic, _clinic_id())
+        except Exception:
+            logger.exception("Telegram clinic lookup failed")
+            await query.edit_message_text("Booking is temporarily unavailable.")
+            return
+        today, last = _booking_date_limits(clinic)
+        if chosen < today or chosen > last:
+            await query.edit_message_text(
+                f"Please choose a date between today and {last:%d %b %Y}.",
+                reply_markup=_date_keyboard(clinic),
+            )
+            return
+        booking = context.user_data.get("booking") or {}
+        booking["date"] = chosen.isoformat()
+        context.user_data["booking_date"] = chosen.isoformat()
+        await _show_booking_slots_for_date(query.message, context, edit=True)
         return
 
     if data.startswith("bslot:"):
@@ -1444,91 +1615,189 @@ async def _callbacks(update, context):
         await _ask_profile(query.message, context)
         return
 
-async def _show_booking_slots(update_or_query, context):
+def _booking_date_limits(clinic) -> tuple[date, date]:
+    today = datetime.now(ZoneInfo(clinic.timezone)).date()
+    return today, today + timedelta(days=30)
+
+
+def _date_keyboard(clinic) -> InlineKeyboardMarkup:
+    today, last = _booking_date_limits(clinic)
+    rows = []
+    row = []
+    current = today
+    while current <= last:
+        label = "Today" if current == today else current.strftime("%a %d %b")
+        row.append(InlineKeyboardButton(label, callback_data=f"bdate:{current.isoformat()}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+        current += timedelta(days=1)
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("Enter date manually", callback_data="bdate-manual")])
+    rows.append(_main_menu_row())
+    return InlineKeyboardMarkup(rows)
+
+
+async def _show_booking_date_menu(update_or_query, context):
     booking = context.user_data.get("booking") or {}
-    services, _total, duration = _selected_summary(booking)
-    message = getattr(update_or_query, "message", None)
+    message = getattr(update_or_query, "message", None) or getattr(
+        update_or_query, "effective_message", None
+    )
     if message is None:
-        message = getattr(update_or_query, "effective_message", None)
-    if not services or message is None:
-        if message is not None:
-            await message.edit_text(
-                "Your service selection expired. Please start again."
-            )
         return
-    doctor_id = booking.get("dentist_id")
-    doctor_name = (booking.get("dentists") or {}).get(doctor_id) or "the doctor"
     try:
         clinic = await asyncio.to_thread(get_active_clinic, _clinic_id())
+    except Exception:
+        logger.exception("Telegram clinic lookup failed")
+        await message.edit_text("Booking is temporarily unavailable.")
+        return
+    today, last = _booking_date_limits(clinic)
+    doctor = (booking.get("dentists") or {}).get(booking.get("dentist_id")) or "the doctor"
+    await message.edit_text(
+        f"Choose an appointment date for {doctor}. You can book from today "
+        f"({today:%d %b %Y}) through {last:%d %b %Y}.",
+        reply_markup=_date_keyboard(clinic),
+    )
+
+
+async def _show_booking_slots_for_date(message, context, *, edit: bool):
+    booking = context.user_data.get("booking") or {}
+    services, _total, duration = _selected_summary(booking)
+    date_value = context.user_data.get("booking_date")
+    if not services or not booking.get("dentist_id") or not date_value:
+        await message.reply_text(
+            "Your booking selection expired. Please start again.",
+            reply_markup=_menu(),
+        )
+        return
+    try:
+        chosen = date.fromisoformat(date_value)
+    except ValueError:
+        await message.reply_text(
+            "That date is invalid. Please choose another date.",
+            reply_markup=_menu(),
+        )
+        return
+
+    try:
+        clinic = await asyncio.to_thread(get_active_clinic, _clinic_id())
+        today, last = _booking_date_limits(clinic)
+        if chosen < today or chosen > last:
+            await message.reply_text(
+                f"Please choose a date between today and {last:%d %b %Y}.",
+                reply_markup=_date_keyboard(clinic),
+            )
+            return
         timezone = ZoneInfo(clinic.timezone)
+        day_start = datetime.combine(chosen, time.min, tzinfo=timezone)
+        day_end = day_start + timedelta(days=1)
         now = datetime.now(timezone)
+        window_start = day_start
+        if chosen == today:
+            window_start = max(day_start, now + timedelta(hours=1))
+        if window_start >= day_end:
+            text = (
+                "All appointment slots for this date are fully booked. "
+                "Please select another date."
+            )
+            if edit:
+                await message.edit_text(text, reply_markup=_date_keyboard(clinic))
+            else:
+                await message.reply_text(text, reply_markup=_date_keyboard(clinic))
+            return
+
+        if edit:
+            try:
+                await message.edit_text(
+                    f"Checking availability for {chosen:%a %d %b %Y}…"
+                )
+            except Exception:
+                logger.debug("Could not show slot-check feedback", exc_info=True)
+
+        doctor_id = booking["dentist_id"]
         result = await asyncio.to_thread(
             find_available_slots,
             _clinic_id(),
             doctor_id,
             None,
-            now,
-            now + timedelta(days=get_settings().availability_search_days),
-            20,
+            window_start,
+            day_end,
+            50,
             duration_override_minutes=duration,
         )
     except Exception:
-        logger.exception("Telegram booking slot search failed")
-        await message.edit_text(
-            "I couldn't check availability right now. Please try again."
-        )
+        logger.exception("Telegram date slot search failed")
+        text = "I couldn't check availability right now. Please try again."
+        if edit:
+            await message.edit_text(text)
+        else:
+            await message.reply_text(text)
         return
+
+    doctor_name = (booking.get("dentists") or {}).get(doctor_id) or "the doctor"
     logger.info(
-        "Booking slot search",
+        "Booking date slot search",
         extra={
             "doctor_id": doctor_id,
+            "date": chosen.isoformat(),
             "duration_minutes": duration,
             "status": result.status.value,
             "slot_count": len(result.slots),
             "reason": result.reason,
         },
     )
+
     if result.status.value == "CALENDAR_UNAVAILABLE":
-        await message.edit_text(
+        text = (
             "Google Calendar availability is unavailable right now, so I can't safely "
             "offer slots. Please contact reception or try again later."
         )
+        if edit:
+            await message.edit_text(text)
+        else:
+            await message.reply_text(text)
         return
     if result.status.value in {"SERVICE_NOT_FOUND", "DENTIST_NOT_FOUND"}:
-        await message.edit_text(
-            "The selected doctor or service is no longer available. Please start booking again."
-        )
+        text = "The selected doctor or service is no longer available. Please start booking again."
+        if edit:
+            await message.edit_text(text)
+        else:
+            await message.reply_text(text)
         return
     if result.status.value == "NEEDS_CLARIFICATION":
-        await message.edit_text(
-            result.reason or "The service duration needs to be confirmed by clinic staff."
-        )
-        return
-    now_check = datetime.now(timezone)
-    available = [slot for slot in result.slots if slot.start_at > now_check]
-    if not available:
-        await message.edit_text(
-            f"No available times with {doctor_name} in the next "
-            f"{get_settings().availability_search_days} days for a {duration}-minute "
-            "appointment. Please contact reception."
-        )
+        text = result.reason or "The service duration needs to be confirmed by clinic staff."
+        if edit:
+            await message.edit_text(text)
+        else:
+            await message.reply_text(text)
         return
 
-    # Slots freed by a future cancellation are available again and should be
-    # shown first, ahead of ordinary chronological order.
+    available = [
+        slot for slot in result.slots
+        if slot.start_at >= window_start and slot.start_at > now
+    ]
+    if not available:
+        text = (
+            "All appointment slots for this date are fully booked. "
+            "Please select another date."
+        )
+        if edit:
+            await message.edit_text(text, reply_markup=_date_keyboard(clinic))
+        else:
+            await message.reply_text(text, reply_markup=_date_keyboard(clinic))
+        return
+
     freed_starts: set[datetime] = set()
     try:
-        search_end = now_check + timedelta(
-            days=get_settings().availability_search_days
-        )
         cancelled = await asyncio.to_thread(
             lambda: _client().table("appointments")
             .select("start_at")
             .eq("clinic_id", _clinic_id())
             .eq("dentist_id", doctor_id)
             .eq("status", "cancelled")
-            .gte("start_at", now_check.isoformat())
-            .lte("start_at", search_end.isoformat())
+            .gte("start_at", day_start.isoformat())
+            .lt("start_at", day_end.isoformat())
             .execute()
             .data
             or []
@@ -1555,11 +1824,41 @@ async def _show_booking_slots(update_or_query, context):
         )]
         for index, slot in enumerate(available)
     ]
+    rows.append([InlineKeyboardButton("Choose another date", callback_data="bdate-menu")])
     rows.append(_main_menu_row())
-    await message.edit_text(
-        f"Available times with {doctor_name} (live availability):",
-        reply_markup=InlineKeyboardMarkup(rows),
-    )
+    date_label = "today" if chosen == today else chosen.strftime("%a %d %b %Y")
+    text = f"Available times on {date_label} with {doctor_name}:"
+    if edit:
+        await message.edit_text(text, reply_markup=InlineKeyboardMarkup(rows))
+    else:
+        await message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def _verify_booking_date_input(update, context):
+    value = (update.effective_message.text or "").strip()
+    try:
+        chosen = date.fromisoformat(value)
+    except ValueError:
+        await update.effective_message.reply_text(
+            "Send the date as YYYY-MM-DD, for example 2026-11-20."
+        )
+        return
+    try:
+        clinic = await asyncio.to_thread(get_active_clinic, _clinic_id())
+    except Exception:
+        await update.effective_message.reply_text("Booking is temporarily unavailable.")
+        return
+    today, last = _booking_date_limits(clinic)
+    if chosen < today or chosen > last:
+        await update.effective_message.reply_text(
+            f"Please choose a date between today and {last:%d %b %Y}."
+        )
+        return
+    booking = context.user_data.get("booking") or {}
+    booking["date"] = chosen.isoformat()
+    context.user_data["booking_date"] = chosen.isoformat()
+    context.user_data.pop(STATE, None)
+    await _show_booking_slots_for_date(update.effective_message, context, edit=False)
 
 
 async def _perform_reschedule(query, context):
@@ -2090,13 +2389,13 @@ async def _my_appointments(update, patients: list[dict], context):
         buttons.append([
             InlineKeyboardButton(f"Cancel {reference}", callback_data=f"appt-cancel:{row['id']}"),
         ])
-        if row.get("booking_request_id"):
-            buttons.append([
-                InlineKeyboardButton(
-                    f"Cancel whole plan {reference}",
-                    callback_data=f"plan-cancel:{row['booking_request_id']}",
-                )
-            ])
+    if upcoming:
+        buttons.append([
+            InlineKeyboardButton(
+                f"Cancel all active appointments ({len(upcoming)})",
+                callback_data="cancel-all-appointments",
+            )
+        ])
     for row in past[:3] + cancelled[:3]:
         reference = row.get("appointment_reference") or row["id"][:8]
         buttons.append([
@@ -2401,6 +2700,10 @@ async def _text(update, context):
         _clear_flow(context)
         await msg.reply_text("Main menu", reply_markup=_menu())
         return
+    if text.casefold() == "cancel":
+        _clear_flow(context)
+        await msg.reply_text("Cancelled. You are back at the main menu.", reply_markup=_menu())
+        return
     if _is_emergency(text):
         logger.warning("Emergency symptoms detected in Telegram message")
         await msg.reply_text(EMERGENCY_REPLY, reply_markup=_menu())
@@ -2415,6 +2718,8 @@ async def _text(update, context):
         await _verify_slot_profile_age(update, context)
     elif state == "slot_profile_gender":
         await _verify_slot_profile_gender(update, context)
+    elif state == "booking_date_input":
+        await _verify_booking_date_input(update, context)
     elif state == "lookup_identifier":
         await _verify_lookup_identifier(update, context)
     elif state == "payment":
@@ -2442,6 +2747,7 @@ def build_application():
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured.")
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CallbackQueryHandler(_callbacks))
     app.add_handler(MessageHandler(filters.CONTACT, _contact))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, _media))

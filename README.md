@@ -46,13 +46,23 @@ Persistent menu:
    age, and gender after choosing a slot.
 3. Patient selects one or more services.
 4. Only doctors qualified for **all** selected services are shown.
-5. Live availability is fetched from schedules, existing appointments, and
-   Google Calendar. Patients are not asked to type a date.
-6. Past and already-booked slots are hidden. Slots freed by a future
-   cancellation are shown first.
-7. Patient selects a slot and receives a confirmation containing the
-   appointment reference, patient ID, name, age, gender, doctor, services,
-   date/time, total bill, and payment status.
+5. Patient selects an appointment date:
+   - today through the next 30 days
+   - using date buttons or manual `YYYY-MM-DD` entry
+   - past dates and dates beyond the window are rejected
+6. Live availability is fetched for that date, doctor, and total service
+   duration from schedules, existing appointments, and Google Calendar.
+   For today, slots start at least **one hour** from now. Past/occupied slots
+   are never shown, and slots freed by future cancellations appear first.
+7. Patient selects a slot, reviews the full booking, and explicitly confirms.
+8. The final reservation is atomic: if another patient took the slot first,
+   the bot rejects it and offers the remaining slots for the same date.
+9. Confirmation contains the appointment reference, patient ID, name, age,
+   gender, doctor, services, date/time, total bill, and payment status.
+
+Patients may make **separate bookings for different services** using the same
+phone/email. A patient cannot hold two active appointments for the same service
+and doctor; cancelled bookings release that service.
 
 The current Telegram booking pipeline uses **cash in hand** by default. Online
 receipt upload and manual verification remain available in the database/API and
@@ -60,13 +70,18 @@ staff dashboard.
 
 ### Appointments
 
-- Upcoming, past, and cancelled appointments grouped on one screen.
+- All confirmed appointments are shown, grouped into upcoming, past, and
+  cancelled, with service, doctor, date, time, reference, and status.
 - Pending booking requests are shown with **Retry** and **Cancel request**.
-- Actions: view details, reschedule, cancel one appointment, or cancel the
-  linked booking plan.
+- Actions: view details, reschedule, cancel one appointment, or cancel **all
+  active appointments** for the patient.
+- Each cancellation asks for confirmation, updates the database first, releases
+  the slot, and offers a refresh of the appointment list.
 - Rescheduling searches live slots for the appointment's full service duration.
 - Cancellation removes the Calendar event, cancels pending notifications, and
   erases personal identifiers when no other active booking needs them.
+- `/cancel` (or typing `cancel`) leaves any workflow and returns to the main
+  menu without deleting confirmed bookings.
 
 ### Notifications
 
@@ -324,6 +339,7 @@ Recent additive migrations include:
 - `20261109170000_feedback_notification_trigger.sql`
 - `20261109180000_appointment_notification_scheduler.sql`
 - `20261109190000_reminder_timing_rules.sql`
+- `20261117100000_booking_duplicate_guard.sql`
 
 `supabase/tests/README.md` describes the SQL integrity/RLS suite. It requires a
 disposable project and is not run by `pytest`.
@@ -369,7 +385,7 @@ npm.cmd run typecheck
 npm.cmd run build
 ```
 
-Current suites: **246 backend tests** and **27 dashboard tests**. Unit tests do
+Current suites: **247 backend tests** and **27 dashboard tests**. Unit tests do
 not prove hosted credentials, Calendar permissions, migrations, Telegram
 polling, or deployments work; verify those separately.
 
@@ -420,7 +436,11 @@ process staying up.
 - Booking requires an explicit **Confirm booking** step after the full summary
   is shown. Rescheduling likewise requires an explicit confirmation.
 - Availability is revalidated against schedules, database conflicts, and Google
-  Calendar before an appointment is confirmed.
+  Calendar before an appointment is confirmed. A database exclusion constraint
+  plus an advisory-locked service/doctor check prevents double booking and
+  duplicate active service bookings across all interfaces.
+- Booking dates are limited to today through 30 days ahead; today's slots start
+  at least one hour from now.
 - Booking, rescheduling, cancellation, payments, and notification claims use
   database constraints, RPC transactions, and idempotency keys.
 - Cancellation/rescheduling never proceed without user confirmation.
