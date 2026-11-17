@@ -63,6 +63,11 @@ class Clinic(BaseModel):
     name: str
     timezone: str
     google_calendar_id: str | None = None
+    open_time: time = time(10, 0)
+    close_time: time = time(18, 0)
+    break_start: time | None = time(13, 0)
+    break_end: time | None = time(14, 0)
+    closed_weekdays: list[int] = Field(default_factory=lambda: [6, 7])
 
 
 class Dentist(BaseModel):

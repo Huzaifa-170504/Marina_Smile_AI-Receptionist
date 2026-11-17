@@ -10,6 +10,7 @@ from telegram import Bot
 from telegram.error import TelegramError
 
 from app.database.supabase import get_supabase_client
+from app.telegram.ui import cancel_keyboard
 
 
 logger = logging.getLogger(__name__)
@@ -328,7 +329,11 @@ async def _deliver(bot: Bot, notification: dict) -> None:
             )
             return
 
-        await bot.send_message(chat_id=int(chat_id), text=text)
+        await bot.send_message(
+            chat_id=int(chat_id),
+            text=text,
+            reply_markup=cancel_keyboard(),
+        )
         await asyncio.to_thread(_complete_notification, notification_id)
     except TelegramError as exc:
         logger.warning("Telegram notification delivery failed: %s", exc)

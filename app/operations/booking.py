@@ -15,6 +15,7 @@ from app.integrations.google_calendar import (
     GoogleCalendarClient,
 )
 from app.operations.availability import generate_candidate_starts, intervals_overlap
+from app.operations.clinic_hours import appointment_time_error, get_clinic_holidays
 from app.operations.booking_models import (
     AppointmentRecord,
     BookingResult,
@@ -239,6 +240,27 @@ def _book_appointment(
         )
     local_start = start_at.astimezone(timezone)
     end_at = local_start + timedelta(minutes=service.duration_minutes)
+
+    holidays = get_clinic_holidays(
+        normalized_clinic_id,
+        local_start.date(),
+        local_start.date(),
+        client=supabase,
+    )
+    time_error = appointment_time_error(clinic, local_start, end_at, holidays)
+    if time_error is not None:
+        return _booking_result(
+            BookingStatus.OUTSIDE_WORKING_HOURS,
+            normalized_clinic_id,
+            normalized_contact_id,
+            dentist.id,
+            dentist.name,
+            service.id,
+            service.name,
+            local_start,
+            end_at,
+            time_error,
+        )
 
     if normalized_request_id:
         existing = get_appointment_by_booking_request(

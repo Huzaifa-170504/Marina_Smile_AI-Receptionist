@@ -49,11 +49,16 @@ Persistent menu:
 5. Patient selects an appointment date:
    - today through the next 30 days
    - using date buttons or manual `YYYY-MM-DD` entry
+   - Saturdays, Sundays, and configured public holidays are excluded and rejected
    - past dates and dates beyond the window are rejected
 6. Live availability is fetched for that date, doctor, and total service
    duration from schedules, existing appointments, and Google Calendar.
-   For today, slots start at least **one hour** from now. Past/occupied slots
-   are never shown, and slots freed by future cancellations appear first.
+   - clinic hours are **10:00 AM–6:00 PM**
+   - the **1:00 PM–2:00 PM** break is excluded
+   - the whole appointment must fit inside clinic hours and outside the break
+   - for today, slots start at least **one hour** from now
+   - past/occupied slots are never shown; slots freed by future cancellations
+     appear first
 7. Patient selects a slot, reviews the full booking, and explicitly confirms.
 8. The final reservation is atomic: if another patient took the slot first,
    the bot rejects it and offers the remaining slots for the same date.
@@ -82,6 +87,33 @@ staff dashboard.
   erases personal identifiers when no other active booking needs them.
 - `/cancel` (or typing `cancel`) leaves any workflow and returns to the main
   menu without deleting confirmed bookings.
+
+### Clinic hours and holidays
+
+- Operating hours: **10:00 AM–6:00 PM**, Monday–Friday.
+- Daily break: **1:00 PM–2:00 PM**. No appointment may overlap it.
+- Saturday and Sunday: closed.
+- Public holidays: closed.
+
+Operating hours, break times, and closed weekdays are stored on `clinics`.
+Public holidays are stored in `clinic_holidays` (`clinic_id`, `holiday_date`,
+optional `name`) and can be added or changed in SQL without code changes:
+
+```sql
+insert into public.clinic_holidays (clinic_id, holiday_date, name)
+values ('<clinic-uuid>', '2026-12-02', 'Public holiday')
+on conflict (clinic_id, holiday_date) do update set name = excluded.name;
+```
+
+The same rules are enforced in Telegram date/slot selection, availability and
+rescheduling services, and a final database appointment trigger.
+
+### Universal navigation
+
+Every bot reply carries an inline **❌ Cancel & Main Menu** button. Existing
+inline buttons are preserved and the cancel button is appended. `/cancel` and
+typing `cancel` remain available. Cancelling a workflow clears temporary state
+only; confirmed bookings are not changed.
 
 ### Notifications
 
@@ -340,6 +372,7 @@ Recent additive migrations include:
 - `20261109180000_appointment_notification_scheduler.sql`
 - `20261109190000_reminder_timing_rules.sql`
 - `20261117100000_booking_duplicate_guard.sql`
+- `20261117110000_clinic_hours_and_holidays.sql`
 
 `supabase/tests/README.md` describes the SQL integrity/RLS suite. It requires a
 disposable project and is not run by `pytest`.
@@ -385,7 +418,7 @@ npm.cmd run typecheck
 npm.cmd run build
 ```
 
-Current suites: **247 backend tests** and **27 dashboard tests**. Unit tests do
+Current suites: **253 backend tests** and **27 dashboard tests**. Unit tests do
 not prove hosted credentials, Calendar permissions, migrations, Telegram
 polling, or deployments work; verify those separately.
 
@@ -440,7 +473,9 @@ process staying up.
   plus an advisory-locked service/doctor check prevents double booking and
   duplicate active service bookings across all interfaces.
 - Booking dates are limited to today through 30 days ahead; today's slots start
-  at least one hour from now.
+  at least one hour from now. Saturdays, Sundays, configured public holidays,
+  times outside 10:00 AM–6:00 PM, and the 1:00 PM–2:00 PM break are rejected at
+  both the bot and database layers.
 - Booking, rescheduling, cancellation, payments, and notification claims use
   database constraints, RPC transactions, and idempotency keys.
 - Cancellation/rescheduling never proceed without user confirmation.

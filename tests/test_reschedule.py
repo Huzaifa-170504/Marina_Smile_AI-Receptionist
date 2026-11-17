@@ -109,6 +109,11 @@ def _configure_reschedule(
             name="Marina Smile",
             timezone="Asia/Dubai",
             google_calendar_id="clinic-calendar",
+            open_time=time(9, 0),
+            close_time=time(20, 0),
+            break_start=None,
+            break_end=None,
+            closed_weekdays=[],
         ),
     )
     dentists = [

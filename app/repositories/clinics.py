@@ -25,7 +25,10 @@ def get_active_clinic(
     response = (
         (client or get_supabase_client())
         .table("clinics")
-        .select("id,name,timezone,google_calendar_id")
+        .select(
+            "id,name,timezone,google_calendar_id,open_time,close_time,"
+            "break_start,break_end,closed_weekdays"
+        )
         .eq("id", normalized_id)
         .eq("active", True)
         .limit(1)
