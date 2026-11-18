@@ -2744,7 +2744,7 @@ async def _text(update, context):
         _clear_flow(context)
         await msg.reply_text("Main menu", reply_markup=_menu())
         return
-    if text.casefold() == "cancel":
+    if text.casefold() in {"cancel", CANCEL_LABEL.casefold()}:
         _clear_flow(context)
         await msg.reply_text("Cancelled. You are back at the main menu.", reply_markup=_menu())
         return
@@ -2828,7 +2828,11 @@ def install_universal_cancel() -> None:
             return await original_reply(self, text, *args, **kwargs)
         result = await original_reply(self, text, *args, **kwargs)
         try:
-            await original_reply(self, CANCEL_LABEL, reply_markup=cancel_keyboard())
+            await original_reply(
+                self,
+                "Need to start over?",
+                reply_markup=cancel_keyboard(),
+            )
         except Exception:
             logger.exception("Failed to attach universal cancel button")
         return result
@@ -2845,7 +2849,11 @@ def install_universal_cancel() -> None:
             return await original_edit(self, text, *args, **kwargs)
         result = await original_edit(self, text, *args, **kwargs)
         try:
-            await original_reply(self, CANCEL_LABEL, reply_markup=cancel_keyboard())
+            await original_reply(
+                self,
+                "Need to start over?",
+                reply_markup=cancel_keyboard(),
+            )
         except Exception:
             logger.exception("Failed to attach universal cancel button")
         return result
