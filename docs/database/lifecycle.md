@@ -15,6 +15,13 @@ Allowed transitions enforced by `transition_booking_request` are:
 workflow. Expiring an unpaid request does not delete its patient or any prior
 paid history.
 
+**Cash path:** the live Telegram flow does not start at
+`awaiting_patient_info`. `create_booking_request` inserts the request directly
+with `status = 'awaiting_slot_selection'` and `payment_mode = 'cash'`, then
+finalizes it. The transition list above is enforced for requests that move
+through the online payment states; no transition is required to reach
+`awaiting_slot_selection` for cash.
+
 ## Payment attempt
 
 Normal flow is `awaiting -> submitted -> verified|rejected`. A rejected

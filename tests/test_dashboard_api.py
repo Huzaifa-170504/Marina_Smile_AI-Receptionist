@@ -175,6 +175,118 @@ def test_doctor_overview_scopes_every_appointment_query(monkeypatch: Any) -> Non
     assert all(("dentist_id", str(DOCTOR.doctor_id)) in query.filters for query in appointment_queries)
 
 
+def test_overview_scopes_by_permission_not_role_label(monkeypatch: Any) -> None:
+    limited = CurrentStaff(
+        id=UUID("40000000-0000-4000-8000-000000000010"),
+        clinic_id=OWNER.clinic_id,
+        auth_user_id=UUID("50000000-0000-4000-8000-000000000010"),
+        doctor_id=UUID("30000000-0000-4000-8000-000000000010"),
+        full_name="Limited Staff",
+        email="limited@example.com",
+        role="receptionist",
+        active=True,
+        permissions=frozenset({"appointment.view_own"}),
+        overrides=(),
+        access_token="test-limited-token",
+    )
+    clinic_wide_doctor = CurrentStaff(
+        id=UUID("40000000-0000-4000-8000-000000000011"),
+        clinic_id=OWNER.clinic_id,
+        auth_user_id=UUID("50000000-0000-4000-8000-000000000011"),
+        doctor_id=UUID("30000000-0000-4000-8000-000000000011"),
+        full_name="Clinic-wide Doctor",
+        email="wide@example.com",
+        role="doctor",
+        active=True,
+        permissions=frozenset(
+            {"appointment.view_own", "appointment.view_all"}
+        ),
+        overrides=(),
+        access_token="test-wide-token",
+    )
+
+    client = RecordingClient()
+    monkeypatch.setattr("app.api.routes.dashboard.get_supabase_client", lambda: client)
+    _load_overview(limited)
+
+    limited_queries = [
+        query for query in client.queries if query.table == "appointments"
+    ]
+    assert limited_queries
+    assert all(
+        ("dentist_id", str(limited.doctor_id)) in query.filters
+        for query in limited_queries
+    )
+
+    other_client = RecordingClient()
+    monkeypatch.setattr(
+        "app.api.routes.dashboard.get_supabase_client", lambda: other_client
+    )
+    _load_overview(clinic_wide_doctor)
+
+    wide_queries = [
+        query for query in other_client.queries if query.table == "appointments"
+    ]
+    assert wide_queries
+    assert all(
+        not any(column == "dentist_id" for column, _ in query.filters)
+        for query in wide_queries
+    )
+
+
+def test_permission_grant_cannot_exceed_actor_permissions() -> None:
+    from app.api.models import PermissionChangeRequest
+    from app.api.routes.staff import _change_permission
+
+    actor = CurrentStaff(
+        id=UUID("40000000-0000-4000-8000-000000000020"),
+        clinic_id=OWNER.clinic_id,
+        auth_user_id=UUID("50000000-0000-4000-8000-000000000020"),
+        doctor_id=None,
+        full_name="Delegated Manager",
+        email="manager@example.com",
+        role="receptionist",
+        active=True,
+        permissions=frozenset({"staff.manage"}),
+        overrides=(),
+        access_token="test-manager-token",
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        _change_permission(
+            actor,
+            actor.id,
+            PermissionChangeRequest(permission="clinic.manage", allowed=True),
+        )
+
+    assert exc_info.value.status_code == 403
+
+
+def test_only_owner_may_act_on_owner_account() -> None:
+    from app.api.routes.staff import _require_owner_authority
+
+    receptionist = CurrentStaff(
+        id=UUID("40000000-0000-4000-8000-000000000030"),
+        clinic_id=OWNER.clinic_id,
+        auth_user_id=UUID("50000000-0000-4000-8000-000000000030"),
+        doctor_id=None,
+        full_name="Receptionist",
+        email="reception@example.com",
+        role="receptionist",
+        active=True,
+        permissions=frozenset({"staff.manage"}),
+        overrides=(),
+        access_token="test-reception-token",
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        _require_owner_authority(receptionist, "owner")
+    assert exc_info.value.status_code == 403
+
+    _require_owner_authority(OWNER, "owner")
+    _require_owner_authority(receptionist, "receptionist")
+
+
 def test_handoff_rejects_cross_clinic_or_inactive_assignee(monkeypatch: Any) -> None:
     client = RecordingClient()
     monkeypatch.setattr("app.api.routes.handoffs.get_supabase_client", lambda: client)

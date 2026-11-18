@@ -30,7 +30,12 @@ PATIENT_SAFE_TABLES = frozenset({
 PATIENT_SAFE_RPCS = frozenset({
     "transition_booking_request",
     "anonymize_cancelled_booking",
+    "reserve_appointment",
+    "confirm_appointment_reservation",
 })
+
+# The receipt bucket is the only Storage surface the patient flow needs.
+PATIENT_SAFE_BUCKETS = frozenset({"payment-proofs"})
 
 
 class PatientSafeSupabase:
@@ -54,5 +59,19 @@ class PatientSafeSupabase:
         return self._client.rpc(function_name, params or {})
 
     @property
-    def storage(self):
-        return self._client.storage
+    def storage(self) -> "_PatientSafeStorage":
+        return _PatientSafeStorage(self._client.storage)
+
+
+class _PatientSafeStorage:
+    """Restrict Storage access to the patient-facing buckets in the allowlist."""
+
+    def __init__(self, storage: Any) -> None:
+        self._storage = storage
+
+    def from_(self, bucket: str):
+        if bucket not in PATIENT_SAFE_BUCKETS:
+            raise PermissionError(
+                f"Telegram bot access to storage bucket '{bucket}' is blocked by the privacy allowlist."
+            )
+        return self._storage.from_(bucket)

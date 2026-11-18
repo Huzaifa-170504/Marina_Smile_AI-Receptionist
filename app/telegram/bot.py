@@ -285,7 +285,11 @@ async def _continue_booking_identifier(update, context):
     identifier_type, identifier_value = identifier
     try:
         info = await asyncio.to_thread(
-            lookup_identities, _clinic_id(), identifier_type, identifier_value
+            lookup_identities,
+            _clinic_id(),
+            identifier_type,
+            identifier_value,
+            client=_client(),
         )
     except Exception:
         logger.exception("Telegram patient lookup failed")
@@ -558,6 +562,7 @@ def _persist_booking_patient(context) -> dict:
         age_at_registration=profile.get("age"),
         gender=profile.get("gender"),
         telegram_chat_id=context.user_data.get("booking_chat_id"),
+        client=_client(),
     )
 
 
@@ -694,6 +699,7 @@ async def _confirm_selected_booking(message, context):
             start_at=start_at,
             end_at=end_at,
             payment_mode="cash",
+            client=_client(),
         )
     except PatientBookingError as exc:
         await message.reply_text(str(exc), reply_markup=_menu())
@@ -705,7 +711,10 @@ async def _confirm_selected_booking(message, context):
 
     try:
         result = await asyncio.to_thread(
-            finalize_booking_request, _clinic_id(), request["id"]
+            finalize_booking_request,
+            _clinic_id(),
+            request["id"],
+            client=_client(),
         )
     except BookingSlotTakenError:
         await asyncio.to_thread(_cancel_booking_request, request["id"])
@@ -819,7 +828,11 @@ async def _verify_lookup_identifier(update, context):
         return
     try:
         info = await asyncio.to_thread(
-            lookup_identities, _clinic_id(), identifier[0], identifier[1]
+            lookup_identities,
+            _clinic_id(),
+            identifier[0],
+            identifier[1],
+            client=_client(),
         )
     except Exception:
         logger.exception("Telegram identifier lookup failed")
@@ -1111,7 +1124,10 @@ async def _callbacks(update, context):
             return
         try:
             result = await asyncio.to_thread(
-                finalize_booking_request, _clinic_id(), request_id
+                finalize_booking_request,
+                _clinic_id(),
+                request_id,
+                client=_client(),
             )
         except Exception:
             logger.exception("Pending booking request confirmation retry failed")

@@ -25,22 +25,28 @@ shutdown. No separate Render worker is needed.
 4. In a private Telegram chat, send `/start`. The bot and API stop when you
    stop the local process.
 
-## Patient booking and email lookup
+## Patient booking and identity lookup
 
-Booking lookup accepts the patient's registered phone number or email and
-requires their full name to match one active patient record. Telegram's
-"Share registered phone" button remains available. Email lookup requires
-applying `supabase/migrations/20261106104639_add_patient_email_for_telegram.sql`
-to the project's database and adding the patient's email to their contact
-record. This migration is additive; it is not applied automatically by the bot.
+Booking and **My Appointments** accept the patient's registered phone number or
+email. The bot normalizes UAE and Pakistan local/international forms before
+matching, so `04 XXX XXXX` and `+971 4 XXX XXXX` (or `0300 1234567` and
+`+92 300 1234567`) identify the same contact. New or incomplete patients enter
+name, age, and gender **after** choosing a slot; a full-name match is not
+required for returning patients.
 
-The bot checks active services, assigned doctors, and live slots. Receipt-
-requiring requests remain pending until clinic staff verifies the payment.
-On the patient's next **@ Booking status** check, the bot attempts to reserve
-the selected slot and create/confirm its Google Calendar event. Services that
-do not require payment are confirmed immediately through the same reservation
-path. Confirmation requires the existing backend Supabase service key and
-Google Calendar credentials to work.
+Email lookup requires
+`supabase/migrations/20261106104639_add_patient_email_for_telegram.sql`, which is
+already applied on the live project and is included in the ordered migration
+set. Telegram's "Share my phone" button remains available.
+
+The bot checks active services, doctors qualified for all selected services,
+clinic hours (10:00–18:00, break 13:00–14:00, Monday–Friday), public holidays,
+and live slots before reserving. The live default is **cash in hand**: the
+appointment is confirmed immediately with `payment_status = 'unpaid'` and staff
+settle it later. Online receipt upload and manual verification remain available
+through the API and dashboard but are not offered by the current Telegram
+booking flow. Confirmation requires the backend Supabase service key and Google
+Calendar credentials to work.
 
 Do not also run `python -m app.telegram.bot` while the API is polling with the
 same token.
@@ -63,8 +69,19 @@ same token.
 6. Open the **web service** logs. Look for
    `Marina Smile Telegram polling started`. If no token is configured, the API
    logs that it is starting without Telegram.
-7. Send `/start` to the bot, then try **@ See services** and the patient
-   booking flow.
+7. Send `/start` to the bot, then try **Dental Services**, **Our Doctors**, and
+   the **Book Appointment** flow.
+
+### Holiday sync on Render
+
+The holiday scheduler starts with the API and renews every
+`HOLIDAY_SYNC_INTERVAL_HOURS`. It needs the Google service-account file at the
+path in `GOOGLE_APPLICATION_CREDENTIALS`. If `clinic_holiday_sync.last_status`
+is `error` with `Google Calendar credentials are unavailable`, the Render secret
+file is missing, unreadable, or the path is wrong. Working credentials load
+locally from `credentials/google-service-account.json`; on Render the secret
+file must be mounted at `/etc/secrets/google-service-account.json`. Existing
+holiday rows are never deleted by a failed sync.
 
 ## Render free-plan limitation
 

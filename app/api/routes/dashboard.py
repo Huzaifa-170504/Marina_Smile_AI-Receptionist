@@ -34,6 +34,15 @@ def _load_overview(staff: CurrentStaff) -> OverviewResponse:
     can_view_appointments = bool(
         {"appointment.view_all", "appointment.view_own"} & staff.permissions
     )
+    # Scope to the caller's own dentist only when they lack the clinic-wide
+    # permission. The role label alone must never widen or narrow the data.
+    scoped_to_own = (
+        "appointment.view_own" in staff.permissions
+        and "appointment.view_all" not in staff.permissions
+    )
+    own_dentist_id = (
+        str(staff.doctor_id) if scoped_to_own and staff.doctor_id else None
+    )
     metrics = OverviewResponse()
     if can_view_appointments:
         base = (
@@ -41,8 +50,8 @@ def _load_overview(staff: CurrentStaff) -> OverviewResponse:
             .select("id", count="exact")
             .eq("clinic_id", str(staff.clinic_id))
         )
-        if staff.role == "doctor" and staff.doctor_id:
-            base = base.eq("dentist_id", str(staff.doctor_id))
+        if own_dentist_id:
+            base = base.eq("dentist_id", own_dentist_id)
         metrics.todays_appointments = _count(base.gte("start_at", start.isoformat()).lt("start_at", end.isoformat()))
 
         upcoming = (
@@ -52,8 +61,8 @@ def _load_overview(staff: CurrentStaff) -> OverviewResponse:
             .in_("status", ["pending", "confirmed"])
             .gte("start_at", local_now.astimezone(timezone.utc).isoformat())
         )
-        if staff.role == "doctor" and staff.doctor_id:
-            upcoming = upcoming.eq("dentist_id", str(staff.doctor_id))
+        if own_dentist_id:
+            upcoming = upcoming.eq("dentist_id", own_dentist_id)
         metrics.upcoming_appointments = _count(upcoming)
         completed = (
             client.table("appointments").select("id", count="exact")
@@ -70,11 +79,10 @@ def _load_overview(staff: CurrentStaff) -> OverviewResponse:
             .eq("clinic_id", str(staff.clinic_id)).eq("status", "no_show")
             .gte("start_at", start.isoformat()).lt("start_at", end.isoformat())
         )
-        if staff.role == "doctor" and staff.doctor_id:
-            doctor_id = str(staff.doctor_id)
-            completed = completed.eq("dentist_id", doctor_id)
-            cancelled = cancelled.eq("dentist_id", doctor_id)
-            no_shows = no_shows.eq("dentist_id", doctor_id)
+        if own_dentist_id:
+            completed = completed.eq("dentist_id", own_dentist_id)
+            cancelled = cancelled.eq("dentist_id", own_dentist_id)
+            no_shows = no_shows.eq("dentist_id", own_dentist_id)
         metrics.completed_today = _count(completed)
         metrics.todays_cancellations = _count(cancelled)
         metrics.no_shows_today = _count(no_shows)
@@ -84,8 +92,8 @@ def _load_overview(staff: CurrentStaff) -> OverviewResponse:
             .eq("clinic_id", str(staff.clinic_id))
             .gte("start_at", start.isoformat()).lt("start_at", end.isoformat())
         )
-        if staff.role == "doctor" and staff.doctor_id:
-            appointment_ids_query = appointment_ids_query.eq("dentist_id", str(staff.doctor_id))
+        if own_dentist_id:
+            appointment_ids_query = appointment_ids_query.eq("dentist_id", own_dentist_id)
         appointment_ids = [row["id"] for row in appointment_ids_query.execute().data or []]
         if appointment_ids:
             metrics.waiting_patients = _count(

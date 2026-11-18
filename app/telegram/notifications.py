@@ -88,17 +88,16 @@ def _retry_notification(
         _complete_notification(notification_id, error=error)
 
 
-def _load_contact(contact_id: str) -> dict | None:
+def _load_contact(contact_id: str, clinic_id: str | None = None) -> dict | None:
     client = get_supabase_client()
-    rows = (
+    query = (
         client.table("contacts")
         .select("id,telegram_chat_id,name,phone_number,email")
         .eq("id", contact_id)
-        .limit(1)
-        .execute()
-        .data
-        or []
     )
+    if clinic_id:
+        query = query.eq("clinic_id", clinic_id)
+    rows = query.limit(1).execute().data or []
     return rows[0] if rows else None
 
 
@@ -319,7 +318,11 @@ async def _deliver(bot: Bot, notification: dict) -> None:
             )
             return
 
-        contact = await asyncio.to_thread(_load_contact, notification["contact_id"])
+        contact = await asyncio.to_thread(
+            _load_contact,
+            notification["contact_id"],
+            notification.get("clinic_id"),
+        )
         chat_id = contact.get("telegram_chat_id") if contact else None
         if not chat_id:
             await asyncio.to_thread(

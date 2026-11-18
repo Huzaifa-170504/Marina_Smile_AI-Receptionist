@@ -14,13 +14,38 @@ business operations. Gemini extracts intent and generates grounded answers;
 typed application services, PostgreSQL constraints and RPCs, Supabase policies,
 and Google Calendar decide what is true and what actions are allowed.
 
+## Admin dashboard
+
+**Staff / admin dashboard: <https://marinasmileai-receptionist.vercel.app/dashboard>**
+
+**Staff sign-in: <https://marinasmileai-receptionist.vercel.app/login>**
+
+The dashboard is staff-only. There is no public registration: an authenticated
+Supabase user is admitted only when an active `staff_users` row links it to a
+clinic and a role. Unauthenticated visits to `/dashboard` redirect to
+`/login?next=/dashboard`.
+
+Verified on 2026-11-18 by HTTP request to the production deployment:
+
+| Route | Result |
+| --- | --- |
+| `/` | `200`, `<title>Marina Smile AI Receptionist</title>` |
+| `/login` | `200` |
+| `/dashboard` (unauthenticated) | `200` after redirect to `/login?next=%2Fdashboard` |
+
+This URL comes from `render.yaml` (`DASHBOARD_APPLICATION_URL` and
+`DASHBOARD_ALLOWED_ORIGINS`) and the checked-in README, and it was confirmed to
+respond. No other production hostname is asserted here.
+
 ## Live project
 
 | Resource | Link | Status |
 | --- | --- | --- |
-| Recruiter UI | [Live Vercel site](https://marinasmileai-receptionist.vercel.app) | Public demo |
-| Live demo queries | Same site, recruiter demo panel | Vercel proxy and Render backend connected |
-| Vercel project | [Deployment project](https://vercel.com/neural-nexus-59b4/marina_smile_ai-receptionist) | Project supplied by owner |
+| Admin dashboard | [marinasmileai-receptionist.vercel.app/dashboard](https://marinasmileai-receptionist.vercel.app/dashboard) | Staff-only, verified responding |
+| Staff sign-in | [marinasmileai-receptionist.vercel.app/login](https://marinasmileai-receptionist.vercel.app/login) | Supabase Auth, no public registration |
+| Public recruiter demo | [marinasmileai-receptionist.vercel.app](https://marinasmileai-receptionist.vercel.app) | Demo panel on the homepage |
+| Backend API | Render `marina-smile-api` | Health check `GET /health` |
+| Vercel project | [Deployment project](https://vercel.com/neural-nexus-59b4/marina_smile_ai-receptionist) | Requires project access |
 | Source | [GitHub repository](https://github.com/Huzaifa-170504/Marina_Smile_AI-Receptionist) | Public |
 
 The Vercel management URL requires project access and is not presented as the
@@ -183,8 +208,9 @@ Reminder text reports the actual time until the appointment.
 
 - Patient lookup and appointment management are bound to the Telegram chat that
   booked the record. A different Telegram account is refused.
-- The bot uses a patient-safe table/RPC allowlist. Staff, payroll, refund, and
-  audit tables are inaccessible even though the bot uses the service-role key.
+- The bot uses a patient-safe table/RPC/Storage allowlist. Staff, payroll,
+  refund, and audit tables are inaccessible even though the bot uses the
+  service-role key; Storage access is limited to the `payment-proofs` bucket.
 - Cancelling a booking anonymises the patient and contact when no other active
   booking requires them, and deletes receipt images.
 - AI answers refuse staff salaries/payroll, internal staff data, and another
@@ -260,6 +286,9 @@ flowchart LR
 - Grounded answers with source filename, page, and similarity
 - Fixed fallbacks for unsupported context, prompt injection, availability
   claims, medication requests, salaries, and cross-patient data
+- Opening-hours questions are answered from the clinic row (hours, break,
+  closed weekdays, today/tomorrow holidays), never from the demo knowledge PDF,
+  so the AI cannot contradict live booking availability
 - Structured, bounded Gemini intent extraction for scheduling language
 
 ### Operations dashboard
@@ -420,9 +449,19 @@ Recent additive migrations include:
 - `20261117110000_clinic_hours_and_holidays.sql`
 - `20261117120000_google_holiday_sync.sql`
 - `20261117130000_anonymize_contact_whatsapp_id.sql`
+- `20261118120000_change_request_snapshot_columns.sql`
+- `20261118130000_holiday_sync_owner_only.sql`
+- `20261118140000_notification_channel_default.sql`
 
 `supabase/tests/README.md` describes the SQL integrity/RLS suite. It requires a
 disposable project and is not run by `pytest`.
+
+`supabase/preflight/audit_live_catalog.sql` is a **read-only** audit you can run
+in the Supabase SQL editor. It reports tables, RLS state, constraints, indexes,
+policy bodies, grants, security-definer search paths, triggers, data-integrity
+counts (overlaps, calendar-less confirmations, anonymization leaks, duplicate
+holidays, overdue notifications), and holiday-sync health. The PostgREST API
+cannot show these, so this script is how to verify the live catalog.
 
 ## Useful commands
 
@@ -471,7 +510,7 @@ npm.cmd run typecheck
 npm.cmd run build
 ```
 
-Current suites: **270 backend tests** and **27 dashboard tests**. Unit tests do
+Current suites: **280 backend tests** and **27 dashboard tests**. Unit tests do
 not prove hosted credentials, Calendar permissions, migrations, Telegram
 polling, or deployments work; verify those separately.
 
@@ -590,7 +629,12 @@ process staying up.
 - All exposed operational tables use RLS and clinic-scoped authorization.
 - `service_role`/secret credentials are backend-only.
 - The Telegram bot uses a patient-safe allowlist and cannot read staff, payroll,
-  refund, or audit tables.
+  refund, or audit tables. Its booking, lookup, and registration paths pass the
+  allowlisted client into the request pipeline, and its Storage surface is
+  restricted to patient receipt files.
+- Staff management cannot escalate privileges: a delegate can grant only
+  permissions it already holds, and only an owner can invite, promote,
+  deactivate, or change the permissions of another owner.
 - Patient lookups are bound to the linked Telegram chat.
 - Cancelled bookings erase personal identifiers when no other active booking
   requires them; non-identifying audit and financial records are retained.

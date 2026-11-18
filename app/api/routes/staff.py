@@ -55,6 +55,15 @@ async def list_staff(
         raise _onboarding_error(exc) from exc
 
 
+def _require_owner_authority(actor: CurrentStaff, target_role: str) -> None:
+    """Only an owner may act on an owner account."""
+    if target_role == "owner" and actor.role != "owner":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only an owner can manage an owner account",
+        )
+
+
 def _change_permission(
     actor: CurrentStaff,
     target_staff_id: UUID,
@@ -62,6 +71,11 @@ def _change_permission(
 ) -> None:
     if change.permission not in KNOWN_PERMISSIONS:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Unknown permission")
+    if change.allowed is True and change.permission not in actor.permissions:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You cannot grant a permission you do not hold",
+        )
     client = get_supabase_client()
     target = (
         client.table("staff_users")
@@ -77,6 +91,7 @@ def _change_permission(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Owner cannot remove their own staff management access")
 
     role = str(target.data[0]["role"])
+    _require_owner_authority(actor, role)
     role_default = change.permission in ROLE_DEFAULTS[role]
     query = client.table("staff_permission_overrides")
     if change.allowed is None or change.allowed == role_default:
@@ -132,6 +147,7 @@ async def invite_staff(
     invitation: StaffInviteRequest,
     staff: Annotated[CurrentStaff, Depends(require_permission("staff.manage"))],
 ) -> dict[str, object]:
+    _require_owner_authority(staff, invitation.role)
     try:
         result = await run_in_threadpool(
             StaffOnboardingService().invite_staff,
@@ -164,7 +180,7 @@ def _set_active(actor: CurrentStaff, target_staff_id: UUID, active: bool) -> Non
     client = get_supabase_client()
     target = (
         client.table("staff_users")
-        .select("id,doctor_id")
+        .select("id,doctor_id,role")
         .eq("clinic_id", str(actor.clinic_id))
         .eq("id", str(target_staff_id))
         .limit(1)
@@ -172,6 +188,7 @@ def _set_active(actor: CurrentStaff, target_staff_id: UUID, active: bool) -> Non
     )
     if not target.data:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Staff member not found")
+    _require_owner_authority(actor, str(target.data[0]["role"]))
     response = (
         client.table("staff_users")
         .update({"active": active})
@@ -252,6 +269,8 @@ def _change_role(actor: CurrentStaff, target_staff_id: UUID, role: str) -> None:
     )
     if not target.data:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Staff member not found")
+    _require_owner_authority(actor, str(target.data[0]["role"]))
+    _require_owner_authority(actor, role)
     if target.data[0]["role"] == "doctor" or target.data[0].get("doctor_id"):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,

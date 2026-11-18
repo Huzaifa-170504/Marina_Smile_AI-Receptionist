@@ -1,9 +1,13 @@
 # Patient operations database foundation
 
-Migration `0016_patient_operations_foundation.sql` is a local-only foundation.
-It must not be applied remotely without explicit approval. The repository CLI
-link is verified as `lpsjfkyixoubhrryaadk`; the separately exposed project
-`dsbxndbbpryisxevjjgc` is unrelated and must not be mutated.
+Migration `0016_patient_operations_foundation.sql` is **applied on the live
+project** `lpsjfkyixoubhrryaadk`, together with `0001`–`0015` and the later
+timestamped releases. The separately exposed project `dsbxndbbpryisxevjjgc` is
+unrelated and must not be mutated.
+
+Because `0016` is applied, edit it never: add a new timestamped migration for
+any further change. The deferred items described below remain future work, not
+a reason to re-run or rewrite this file.
 
 ## Check-in configuration boundary
 

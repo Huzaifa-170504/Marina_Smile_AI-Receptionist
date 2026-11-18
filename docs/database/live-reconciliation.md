@@ -1,5 +1,20 @@
 # Live schema reconciliation handoff
 
+> **ARCHIVED — already applied; do not run.**
+>
+> This document records a one-off history repair prepared for an earlier
+> snapshot. As of 2026-11-18 the live project `lpsjfkyixoubhrryaadk` has
+> `0001`–`0016` and every timestamped migration through
+> `20261118140000_notification_channel_default.sql` applied. Nothing below is
+> pending, and no repair or push command should be executed.
+>
+> The snapshot also turned out to be incomplete: live
+> `appointment_change_requests` was missing `old_service_id` and
+> `old_google_calendar_event_id`, so the `0008`/`0014` rows below overstated
+> equivalence. `20261118120000_change_request_snapshot_columns.sql` reconciles
+> that drift additively. Treat the "verified" column as historical, not as proof
+> of the current catalog.
+
 This repository prepares, but does not apply, the reconciliation for Supabase
 project `lpsjfkyixoubhrryaadk`. The separately exposed project
 `dsbxndbbpryisxevjjgc` is not a target and must not be mutated.
@@ -18,7 +33,7 @@ Only after a backup, a maintenance window, and final approval:
 6. Run database contract tests, RLS role tests, and security/performance
    advisors before restoring normal traffic.
 
-Proposed history repair command (prepared only; do not run without approval):
+Historical proposal, retained for provenance only (do not run):
 
 ```powershell
 npx.cmd --yes supabase@2.120.0 migration repair 0001 0002 0003 0004 0005 0006 0007 0008 0009 0010 0011 0012 0013 0014 --linked --status applied

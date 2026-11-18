@@ -1,6 +1,8 @@
+from datetime import time
+
 import pytest
 
-from app.operations.models import Dentist, Service
+from app.operations.models import Clinic, Dentist, Service
 from app.services import clinic_directory
 
 
@@ -195,4 +197,102 @@ def test_unrelated_question_continues_to_rag() -> None:
     assert clinic_directory.answer_clinic_directory_question(
         CLINIC_ID,
         "How much is teeth whitening?",
+    ) is None
+
+
+def _clinic(**overrides: object) -> Clinic:
+    values: dict[str, object] = {
+        "id": CLINIC_ID,
+        "name": "Marina Smile Dental Clinic",
+        "timezone": "Asia/Dubai",
+        "open_time": time(10, 0),
+        "close_time": time(18, 0),
+        "break_start": time(13, 0),
+        "break_end": time(14, 0),
+        "closed_weekdays": [6, 7],
+    }
+    values.update(overrides)
+    return Clinic.model_validate(values)
+
+
+def test_opening_hours_for_open_weekday_come_from_clinic_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        clinic_directory, "get_active_clinic", lambda _clinic_id: _clinic()
+    )
+
+    result = clinic_directory.answer_clinic_directory_question(
+        CLINIC_ID,
+        "What time are you open on Friday?",
+    )
+
+    assert result is not None
+    assert result.grounding == "supabase"
+    assert result.text.startswith(
+        "On Friday, the clinic is open from 10:00 AM to 6:00 PM"
+    )
+
+
+def test_opening_hours_for_closed_weekend_are_not_invented(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        clinic_directory, "get_active_clinic", lambda _clinic_id: _clinic()
+    )
+
+    result = clinic_directory.answer_clinic_directory_question(
+        CLINIC_ID,
+        "Are you open on Saturday?",
+    )
+
+    assert result is not None
+    assert result.grounding == "supabase"
+    assert result.text.startswith("The clinic is closed on Saturday.")
+
+
+def test_generic_opening_hours_include_break_and_closed_days(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        clinic_directory, "get_active_clinic", lambda _clinic_id: _clinic()
+    )
+
+    result = clinic_directory.answer_clinic_directory_question(
+        CLINIC_ID,
+        "What are your opening hours?",
+    )
+
+    assert result is not None
+    assert "Monday to Friday from 10:00 AM to 6:00 PM" in result.text
+    assert "break from 1:00 PM to 2:00 PM" in result.text
+    assert "closed on Saturday and Sunday" in result.text
+
+
+def test_slot_availability_question_is_not_treated_as_opening_hours(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        clinic_directory,
+        "get_active_clinic",
+        lambda _clinic_id: pytest.fail("Availability questions must not read clinic hours"),
+    )
+
+    assert clinic_directory.answer_clinic_directory_question(
+        CLINIC_ID,
+        "What times are available for appointments?",
+    ) is None
+
+
+def test_opening_hours_fall_back_to_rag_when_clinic_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise(_clinic_id: str) -> Clinic:
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(clinic_directory, "get_active_clinic", _raise)
+
+    assert clinic_directory.answer_clinic_directory_question(
+        CLINIC_ID,
+        "What are your opening hours?",
     ) is None
