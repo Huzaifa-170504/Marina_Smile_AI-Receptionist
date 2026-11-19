@@ -16,6 +16,7 @@ from app.operations.models import (
     Clinic,
     Dentist,
     DentistSchedule,
+    ScheduleOverride,
     Service,
 )
 from app.repositories.dentists import match_dentists
@@ -117,6 +118,11 @@ def configured_finder(monkeypatch: pytest.MonkeyPatch) -> None:
         "list_blocking_appointments",
         lambda *_args, **_kwargs: [],
     )
+    monkeypatch.setattr(
+        slot_finder,
+        "list_schedule_overrides",
+        lambda *_args, **_kwargs: [],
+    )
 
 
 def test_name_and_controlled_service_resolution() -> None:
@@ -177,6 +183,108 @@ def test_calendar_conflict_filters_only_matching_dentist(
 
     assert result.status == AvailabilityStatus.AVAILABLE
     assert all(slot.start_at >= busy.end_at for slot in result.slots)
+
+
+def test_database_appointment_conflict_filters_only_overlapping_slots(
+    configured_finder: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    busy = BusyInterval(
+        dentist_id=SARA_ID,
+        start_at=datetime(2026, 10, 19, 9, 15, tzinfo=TIMEZONE),
+        end_at=datetime(2026, 10, 19, 10, 0, tzinfo=TIMEZONE),
+    )
+    monkeypatch.setattr(
+        slot_finder,
+        "list_blocking_appointments",
+        lambda *_args, **_kwargs: [busy],
+    )
+
+    result = slot_finder.find_available_slots(
+        CLINIC_ID,
+        SARA_ID,
+        None,
+        WINDOW_START,
+        WINDOW_END,
+        limit=20,
+        duration_override_minutes=30,
+        client=SimpleNamespace(),  # type: ignore[arg-type]
+        calendar_client=_Calendar(),
+    )
+
+    assert result.status == AvailabilityStatus.AVAILABLE
+    assert all(slot.start_at >= busy.end_at for slot in result.slots)
+    assert datetime(2026, 10, 19, 10, 0, tzinfo=TIMEZONE) in {
+        slot.start_at for slot in result.slots
+    }
+
+
+def test_extra_schedule_override_adds_slots_beyond_weekly_hours(
+    configured_finder: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        slot_finder,
+        "list_schedule_overrides",
+        lambda *_args, **_kwargs: [
+            ScheduleOverride(
+                dentist_id=SARA_ID,
+                start_at=datetime(2026, 10, 19, 11, 0, tzinfo=TIMEZONE),
+                end_at=datetime(2026, 10, 19, 12, 0, tzinfo=TIMEZONE),
+                override_type="extra_availability",
+            )
+        ],
+    )
+
+    result = slot_finder.find_available_slots(
+        CLINIC_ID,
+        SARA_ID,
+        None,
+        WINDOW_START,
+        datetime(2026, 10, 19, 12, 0, tzinfo=TIMEZONE),
+        limit=20,
+        duration_override_minutes=30,
+        client=SimpleNamespace(),  # type: ignore[arg-type]
+        calendar_client=_Calendar(),
+    )
+
+    assert [slot.start_at for slot in result.slots if slot.start_at.hour == 11] == [
+        datetime(2026, 10, 19, 11, minute, tzinfo=TIMEZONE)
+        for minute in (0, 15, 30)
+    ]
+
+
+def test_unavailable_schedule_override_removes_only_overlapping_slots(
+    configured_finder: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        slot_finder,
+        "list_schedule_overrides",
+        lambda *_args, **_kwargs: [
+            ScheduleOverride(
+                dentist_id=SARA_ID,
+                start_at=datetime(2026, 10, 19, 9, 0, tzinfo=TIMEZONE),
+                end_at=datetime(2026, 10, 19, 10, 0, tzinfo=TIMEZONE),
+                override_type="unavailable",
+            )
+        ],
+    )
+
+    result = slot_finder.find_available_slots(
+        CLINIC_ID,
+        SARA_ID,
+        None,
+        WINDOW_START,
+        WINDOW_END,
+        limit=20,
+        duration_override_minutes=30,
+        client=SimpleNamespace(),  # type: ignore[arg-type]
+        calendar_client=_Calendar(),
+    )
+
+    assert result.status == AvailabilityStatus.AVAILABLE
+    assert all(slot.start_at >= datetime(2026, 10, 19, 10, 0, tzinfo=TIMEZONE) for slot in result.slots)
 
 
 def test_calendar_failure_returns_unavailable_status(

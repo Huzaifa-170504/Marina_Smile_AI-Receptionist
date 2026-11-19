@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, time
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -95,6 +96,15 @@ class DentistSchedule(BaseModel):
     weekday: int = Field(ge=0, le=6)
     start_time: time
     end_time: time
+
+
+class ScheduleOverride(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    dentist_id: str
+    start_at: datetime
+    end_at: datetime
+    override_type: Literal["unavailable", "extra_availability"]
 
 
 class BusyInterval(BaseModel):

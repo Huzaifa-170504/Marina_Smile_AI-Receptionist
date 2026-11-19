@@ -4,11 +4,13 @@ from zoneinfo import ZoneInfo
 
 from app.operations.availability import (
     generate_candidate_starts,
+    generate_candidate_starts_in_interval,
     intervals_overlap,
     remove_conflicting_starts,
 )
 from app.operations.models import BusyInterval, DentistSchedule
 from app.repositories.appointments import list_blocking_appointments
+from app.repositories.schedules import list_schedule_overrides
 
 
 TIMEZONE = ZoneInfo("Asia/Dubai")
@@ -45,6 +47,23 @@ def test_candidate_slots_align_and_fit_full_duration() -> None:
         datetime(2026, 10, 19, 9, 15, tzinfo=TIMEZONE),
         datetime(2026, 10, 19, 9, 30, tzinfo=TIMEZONE),
         datetime(2026, 10, 19, 9, 45, tzinfo=TIMEZONE),
+    ]
+
+
+def test_extra_availability_interval_generates_slots_inside_its_window() -> None:
+    starts = generate_candidate_starts_in_interval(
+        datetime(2026, 10, 19, 11, 7, tzinfo=TIMEZONE),
+        datetime(2026, 10, 19, 12, 0, tzinfo=TIMEZONE),
+        window_start=datetime(2026, 10, 19, 9, 0, tzinfo=TIMEZONE),
+        window_end=datetime(2026, 10, 19, 13, 0, tzinfo=TIMEZONE),
+        duration_minutes=30,
+        interval_minutes=15,
+        timezone=TIMEZONE,
+    )
+
+    assert starts == [
+        datetime(2026, 10, 19, 11, 15, tzinfo=TIMEZONE),
+        datetime(2026, 10, 19, 11, 30, tzinfo=TIMEZONE),
     ]
 
 
@@ -141,3 +160,56 @@ def test_appointment_conflict_query_can_exclude_current_appointment() -> None:
     )
 
     assert ("neq", "id", appointment_id) in client.query.filters
+
+
+def test_schedule_override_query_is_clinic_and_window_scoped() -> None:
+    class OverrideQuery:
+        def __init__(self) -> None:
+            self.filters: list[tuple[str, str, object]] = []
+
+        def select(self, _columns: str) -> "OverrideQuery":
+            return self
+
+        def eq(self, column: str, value: object) -> "OverrideQuery":
+            self.filters.append(("eq", column, value))
+            return self
+
+        def in_(self, column: str, value: object) -> "OverrideQuery":
+            self.filters.append(("in", column, value))
+            return self
+
+        def lt(self, column: str, value: object) -> "OverrideQuery":
+            self.filters.append(("lt", column, value))
+            return self
+
+        def gt(self, column: str, value: object) -> "OverrideQuery":
+            self.filters.append(("gt", column, value))
+            return self
+
+        def execute(self) -> SimpleNamespace:
+            return SimpleNamespace(data=[])
+
+    class OverrideClient:
+        def __init__(self) -> None:
+            self.query = OverrideQuery()
+
+        def table(self, name: str) -> OverrideQuery:
+            assert name == "schedule_overrides"
+            return self.query
+
+    client = OverrideClient()
+    start = datetime(2026, 10, 19, 9, 0, tzinfo=TIMEZONE)
+    end = datetime(2026, 10, 19, 12, 0, tzinfo=TIMEZONE)
+
+    list_schedule_overrides(
+        CLINIC_ID,
+        [DENTIST_ID],
+        start,
+        end,
+        client=client,  # type: ignore[arg-type]
+    )
+
+    assert ("eq", "clinic_id", CLINIC_ID) in client.query.filters
+    assert ("in", "dentist_id", [DENTIST_ID]) in client.query.filters
+    assert ("lt", "start_at", end.isoformat()) in client.query.filters
+    assert ("gt", "end_at", start.isoformat()) in client.query.filters

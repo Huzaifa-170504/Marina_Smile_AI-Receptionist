@@ -60,8 +60,16 @@ MENU = (
     ("Ask Marina AI", "Payments & Pricing"),
     ("Help & Contact Reception",),
 )
-IDENTIFIER_PROMPT = (
-    "Enter the phone number you used to book, in international or local format:\n"
+BOOKING_IDENTIFIER_PROMPT = (
+    "Enter the phone number you want to use for the booking.\n"
+    "Use international or local format:\n"
+    "• UAE: +971 4 XXX XXXX or 04 XXX XXXX\n"
+    "• Pakistan: +92 300 1234567 or 0300 1234567\n"
+    "Or enter your email address."
+)
+LOOKUP_IDENTIFIER_PROMPT = (
+    "Enter the phone number you used to book.\n"
+    "Use international or local format:\n"
     "• UAE: +971 4 XXX XXXX or 04 XXX XXXX\n"
     "• Pakistan: +92 300 1234567 or 0300 1234567\n"
     "Or enter your email address."
@@ -237,7 +245,6 @@ def _clear_flow(context):
         "reschedule_choice",
         "confirm_lock",
         "booking_date",
-        "booking_holidays",
         "slots",
         "request_id",
         "cancel_status",
@@ -339,7 +346,7 @@ async def _continue_booking_identifier(update, context):
 async def _verify_booking_identifier(update, context):
     identifier = _normalize_identifier(update.effective_message.text or "")
     if identifier is None:
-        await update.effective_message.reply_text(IDENTIFIER_PROMPT)
+        await update.effective_message.reply_text(BOOKING_IDENTIFIER_PROMPT)
         return
     context.user_data["booking_identifier"] = identifier
     context.user_data["booking_chat_id"] = (
@@ -818,13 +825,13 @@ async def _begin_lookup(update, context, target: str):
     context.user_data["lookup_target"] = target
     context.user_data[STATE] = "lookup_identifier"
     message = getattr(update, "effective_message", None) or update.message
-    await message.reply_text(IDENTIFIER_PROMPT)
+    await message.reply_text(LOOKUP_IDENTIFIER_PROMPT)
 
 
 async def _verify_lookup_identifier(update, context):
     identifier = _normalize_identifier(update.effective_message.text or "")
     if identifier is None:
-        await update.effective_message.reply_text(IDENTIFIER_PROMPT)
+        await update.effective_message.reply_text(LOOKUP_IDENTIFIER_PROMPT)
         return
     try:
         info = await asyncio.to_thread(
@@ -890,7 +897,7 @@ async def _begin_booking(update, context):
     _clear_flow(context)
     context.user_data[STATE] = "booking_identifier"
     await update.effective_message.reply_text(
-        IDENTIFIER_PROMPT,
+        BOOKING_IDENTIFIER_PROMPT,
         reply_markup=ReplyKeyboardMarkup(
             [[KeyboardButton("Share my phone", request_contact=True)]],
             resize_keyboard=True,
@@ -1592,7 +1599,7 @@ async def _callbacks(update, context):
     if data.startswith("bslot:"):
         booking = context.user_data.get("booking") or {}
         try:
-            slot = context.user_data["slots"][int(data.removeprefix("bslot:"))]
+            slot = _booking_slot_from_callback(data, context)
         except (KeyError, TypeError, ValueError, IndexError):
             await query.edit_message_text(
                 "That time choice expired. Please choose a doctor again."
@@ -1615,6 +1622,13 @@ async def _callbacks(update, context):
 def _booking_date_limits(clinic) -> tuple[date, date]:
     today = datetime.now(ZoneInfo(clinic.timezone)).date()
     return today, today + timedelta(days=30)
+
+
+def _booking_slot_from_callback(data: str, context):
+    slot_date, slot_index = data.removeprefix("bslot:").split(":", 1)
+    if slot_date != context.user_data.get("booking_date"):
+        raise ValueError("slot belongs to a different date")
+    return context.user_data["slots"][int(slot_index)]
 
 
 def _date_keyboard(
@@ -1648,25 +1662,20 @@ def _date_keyboard(
     return InlineKeyboardMarkup(rows)
 
 
-async def _booking_holiday_dates(clinic, context) -> set[date]:
-    cached = context.user_data.get("booking_holidays")
-    if cached is not None:
-        return {date.fromisoformat(value) for value in cached}
+async def _booking_holiday_dates(clinic, _context) -> set[date]:
     today, last = _booking_date_limits(clinic)
-    holidays = await asyncio.to_thread(
+    return await asyncio.to_thread(
         get_clinic_holidays,
         _clinic_id(),
         today,
         last,
         client=_client(),
     )
-    context.user_data["booking_holidays"] = sorted(
-        value.isoformat() for value in holidays
-    )
-    return holidays
 
 
 async def _show_booking_date_menu(update_or_query, context):
+    context.user_data.pop("booking_date", None)
+    context.user_data.pop("slots", None)
     booking = context.user_data.get("booking") or {}
     message = getattr(update_or_query, "message", None) or getattr(
         update_or_query, "effective_message", None
@@ -1690,6 +1699,7 @@ async def _show_booking_date_menu(update_or_query, context):
 
 
 async def _show_booking_slots_for_date(message, context, *, edit: bool):
+    context.user_data.pop("slots", None)
     booking = context.user_data.get("booking") or {}
     services, _total, duration = _selected_summary(booking)
     date_value = context.user_data.get("booking_date")
@@ -1740,7 +1750,7 @@ async def _show_booking_slots_for_date(message, context, *, edit: bool):
             window_start = max(day_start, now + timedelta(hours=1))
         if window_start >= day_end:
             text = (
-                "All appointment slots for this date are fully booked. "
+                "No appointment times are available for this date. "
                 "Please select another date."
             )
             if edit:
@@ -1825,7 +1835,7 @@ async def _show_booking_slots_for_date(message, context, *, edit: bool):
     ]
     if not available:
         text = (
-            "All appointment slots for this date are fully booked. "
+            "No appointment times are available for this date. "
             "Please select another date."
         )
         if edit:
@@ -1870,7 +1880,7 @@ async def _show_booking_slots_for_date(message, context, *, edit: bool):
     rows = [
         [InlineKeyboardButton(
             slot.start_at.astimezone(timezone).strftime("%a %d %b, %I:%M %p"),
-            callback_data=f"bslot:{index}",
+            callback_data=f"bslot:{chosen.isoformat()}:{index}",
         )]
         for index, slot in enumerate(available)
     ]

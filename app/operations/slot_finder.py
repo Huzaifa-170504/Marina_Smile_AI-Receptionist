@@ -15,6 +15,7 @@ from app.integrations.google_calendar import (
 )
 from app.operations.availability import (
     generate_candidate_starts,
+    generate_candidate_starts_in_interval,
     remove_conflicting_starts,
 )
 from app.operations.clinic_hours import (
@@ -27,6 +28,7 @@ from app.operations.models import (
     AvailabilitySearchResult,
     AvailabilityStatus,
     AvailableSlot,
+    BusyInterval,
     OperationalIntent,
 )
 from app.repositories.appointments import list_blocking_appointments
@@ -36,7 +38,7 @@ from app.repositories.dentists import (
     list_active_dentists,
     match_dentists,
 )
-from app.repositories.schedules import list_active_schedules
+from app.repositories.schedules import list_active_schedules, list_schedule_overrides
 from app.repositories.services import list_active_services, match_services
 
 
@@ -152,6 +154,13 @@ def find_available_slots(
         exclude_appointment_id=exclude_appointment_id,
         client=supabase,
     )
+    schedule_overrides = list_schedule_overrides(
+        normalized_clinic_id,
+        dentist_ids,
+        window_start,
+        window_end,
+        client=supabase,
+    )
 
     reader = calendar_client
     if reader is None:
@@ -181,11 +190,42 @@ def find_available_slots(
             interval_minutes=settings.availability_slot_interval_minutes,
             timezone=timezone,
         )
+        dentist_overrides = [
+            override
+            for override in schedule_overrides
+            if override.dentist_id == dentist.id
+        ]
+        extra_starts = {
+            start
+            for override in dentist_overrides
+            if override.override_type == "extra_availability"
+            for start in generate_candidate_starts_in_interval(
+                override.start_at,
+                override.end_at,
+                window_start=window_start,
+                window_end=window_end,
+                duration_minutes=duration_minutes,
+                interval_minutes=settings.availability_slot_interval_minutes,
+                timezone=timezone,
+            )
+        }
+        starts = sorted(set(starts) | extra_starts)
+        unavailable_intervals = [
+            BusyInterval(
+                dentist_id=override.dentist_id,
+                start_at=override.start_at,
+                end_at=override.end_at,
+            )
+            for override in dentist_overrides
+            if override.override_type == "unavailable"
+        ]
         starts = remove_conflicting_starts(
             starts,
             duration_minutes=duration_minutes,
             busy_intervals=[
-                item for item in appointments if item.dentist_id == dentist.id
+                item
+                for item in [*appointments, *unavailable_intervals]
+                if item.dentist_id == dentist.id
             ],
         )
         if not starts:

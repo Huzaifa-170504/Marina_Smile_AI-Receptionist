@@ -74,6 +74,49 @@ def generate_candidate_starts(
     return sorted(starts)
 
 
+def generate_candidate_starts_in_interval(
+    interval_start: datetime,
+    interval_end: datetime,
+    *,
+    window_start: datetime,
+    window_end: datetime,
+    duration_minutes: int,
+    interval_minutes: int,
+    timezone: ZoneInfo,
+) -> list[datetime]:
+    """Generate aligned slots inside one date-specific availability interval."""
+    values = (interval_start, interval_end, window_start, window_end)
+    if any(value.tzinfo is None for value in values):
+        raise ValueError("availability intervals must be timezone-aware")
+    if duration_minutes <= 0 or interval_minutes <= 0:
+        raise ValueError("duration and interval must be greater than zero")
+
+    local_interval_start = interval_start.astimezone(timezone)
+    local_interval_end = interval_end.astimezone(timezone)
+    local_window_start = window_start.astimezone(timezone)
+    local_window_end = window_end.astimezone(timezone)
+    if local_interval_end <= local_interval_start or local_window_end <= local_window_start:
+        return []
+
+    starts: set[datetime] = set()
+    for target_date in _dates_between(
+        local_interval_start.date(), local_interval_end.date()
+    ):
+        day_start = datetime.combine(target_date, datetime.min.time(), tzinfo=timezone)
+        day_end = day_start + timedelta(days=1)
+        segment_start = max(
+            local_interval_start,
+            local_window_start,
+            day_start,
+        )
+        segment_end = min(local_interval_end, local_window_end, day_end)
+        candidate = _ceil_to_interval(segment_start, interval_minutes)
+        while candidate + timedelta(minutes=duration_minutes) <= segment_end:
+            starts.add(candidate)
+            candidate += timedelta(minutes=interval_minutes)
+    return sorted(starts)
+
+
 def remove_conflicting_starts(
     starts: list[datetime],
     *,
