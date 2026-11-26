@@ -4,7 +4,7 @@ A production-minded dental receptionist and clinic operations platform built
 with Telegram, FastAPI, Next.js, Supabase, Gemini, PostgreSQL/pgvector, and
 Google Calendar.
 
-Patients use a Telegram bot to register, explore services and doctors, see live
+Patients use Telegram and WhatsApp to register, explore services and doctors, see live
 availability, book one or more treatments, manage appointments, check payment
 status, and receive reminders. Clinic staff use a role-aware Next.js dashboard
 for appointments, queue, patients, payments, schedules, and audit.
@@ -51,6 +51,42 @@ respond. No other production hostname is asserted here.
 The Vercel management URL requires project access and is not presented as the
 public demo URL. The recruiter homepage, staff login, aggregate status, and
 read-only demo queries respond through the production deployment.
+
+## Patient workflows (Telegram and WhatsApp)
+
+Both channels use the same patient identity rules, clinic data, live availability,
+booking validation, and final booking services. Telegram presents buttons; WhatsApp
+uses numbered text choices and asks the patient to reply **Confirm** before saving.
+The WhatsApp welcome message is also shown when a patient sends their first message.
+
+### WhatsApp booking
+
+1. The sender's WhatsApp phone number is used to find an existing patient record.
+   New patients provide their name, age, and gender.
+2. Patient chooses one or more active clinic services.
+3. Only doctors qualified for every chosen service are offered.
+4. Patient sends a date in `YYYY-MM-DD` format; the same date limits, clinic hours,
+   holidays, and live calendar availability used by Telegram apply.
+5. Patient chooses a live slot, reviews the booking details, and explicitly confirms.
+6. The same atomic booking request and finalization operations reserve the appointment.
+
+WhatsApp workflow progress is stored in the existing `conversations.workflow_*`
+columns. The webhook verifies Meta's GET verification token and POST
+`X-Hub-Signature-256` signature, and deduplicates inbound message IDs.
+
+To enable the Meta Cloud API adapter, configure all of these server-side values:
+
+| Variable | Purpose |
+| --- | --- |
+| `WHATSAPP_VERIFY_TOKEN` | Random token configured on the Meta webhook subscription |
+| `WHATSAPP_APP_SECRET` | Meta app secret used to validate webhook signatures |
+| `WHATSAPP_ACCESS_TOKEN` | Server-only Cloud API access token |
+| `WHATSAPP_PHONE_NUMBER_ID` | Cloud API sender phone-number ID |
+| `WHATSAPP_GRAPH_API_VERSION` | Graph API version used for outbound messages |
+
+Subscribe the HTTPS callback `https://<backend-host>/webhooks/whatsapp` to the
+WhatsApp `messages` field. No database migration is required because the durable
+workflow columns already exist.
 
 ## Telegram patient workflows
 

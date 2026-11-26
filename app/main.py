@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import dashboard, demo, doctors, handoffs, payments, queue, schedules, staff
+from app.whatsapp.webhook import router as whatsapp_webhook_router
 from app.core.config import get_settings
 
 
@@ -67,6 +68,7 @@ app.include_router(payments.router)
 app.include_router(doctors.router)
 app.include_router(schedules.router)
 app.include_router(handoffs.router)
+app.include_router(whatsapp_webhook_router)
 
 
 @app.get("/health")

@@ -1,5 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
+import re
 from typing import Literal
 from uuid import UUID
 
@@ -95,6 +96,11 @@ class Settings(BaseSettings):
         le=86400,
         alias="DEMO_QUERY_WINDOW_SECONDS",
     )
+    whatsapp_verify_token: SecretStr | None = Field(default=None, alias="WHATSAPP_VERIFY_TOKEN")
+    whatsapp_app_secret: SecretStr | None = Field(default=None, alias="WHATSAPP_APP_SECRET")
+    whatsapp_access_token: SecretStr | None = Field(default=None, alias="WHATSAPP_ACCESS_TOKEN")
+    whatsapp_phone_number_id: str | None = Field(default=None, alias="WHATSAPP_PHONE_NUMBER_ID")
+    whatsapp_graph_api_version: str | None = Field(default=None, alias="WHATSAPP_GRAPH_API_VERSION")
 
     @field_validator(
         "supabase_secret_key",
@@ -121,6 +127,20 @@ class Settings(BaseSettings):
             raise ValueError("DASHBOARD_APPLICATION_URL must be an origin without a path, query, or fragment")
         return value
 
+    @field_validator(
+        "whatsapp_verify_token",
+        "whatsapp_app_secret",
+        "whatsapp_access_token",
+        "whatsapp_phone_number_id",
+        "whatsapp_graph_api_version",
+        mode="before",
+    )
+    @classmethod
+    def empty_whatsapp_settings_are_unset(cls, value):
+        if value is None or not str(value).strip():
+            return None
+        return value
+
     @model_validator(mode="after")
     def validate_chunk_configuration(self) -> "Settings":
         if self.rag_chunk_overlap >= self.rag_chunk_size:
@@ -129,6 +149,19 @@ class Settings(BaseSettings):
             token = self.demo_api_token.get_secret_value() if self.demo_api_token else ""
             if len(token.strip()) < 32:
                 raise ValueError("DEMO_API_TOKEN must contain at least 32 characters when DEMO_ENABLED is true")
+        whatsapp_values = (
+            self.whatsapp_verify_token,
+            self.whatsapp_app_secret,
+            self.whatsapp_access_token,
+            self.whatsapp_phone_number_id,
+            self.whatsapp_graph_api_version,
+        )
+        if any(whatsapp_values) and not all(whatsapp_values):
+            raise ValueError("All WHATSAPP_* settings must be configured together")
+        if self.whatsapp_graph_api_version and not re.fullmatch(
+            r"v\d+\.\d+", self.whatsapp_graph_api_version
+        ):
+            raise ValueError("WHATSAPP_GRAPH_API_VERSION must look like vXX.X")
         return self
 
     @property

@@ -28,6 +28,7 @@ from app.operations.clinic_hours import (
     get_clinic_holidays,
 )
 from app.operations.patient_handoff import create_reception_handoff
+from app.operations.patient_channel import WELCOME_MESSAGE
 from app.operations.patient_booking import (
     BookingSlotTakenError,
     DuplicateServiceBookingError,
@@ -214,7 +215,7 @@ async def _private(update: Update) -> bool:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await _private(update):
         _clear_flow(context)
-        await update.effective_message.reply_text("Welcome to Marina Smile. Choose an option:",
+        await update.effective_message.reply_text(WELCOME_MESSAGE + "\n\nChoose an option:",
                                                    reply_markup=_menu())
 
 
