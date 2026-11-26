@@ -73,6 +73,14 @@ The WhatsApp welcome message is also shown when a patient sends their first mess
 WhatsApp workflow progress is stored in the existing `conversations.workflow_*`
 columns. The webhook verifies Meta's GET verification token and POST
 `X-Hub-Signature-256` signature, and deduplicates inbound message IDs.
+WhatsApp senders are resolved to existing contacts by normalized phone number,
+so an existing Telegram patient can use the same number without creating another
+patient record. Starting a booking in WhatsApp selects WhatsApp for that
+contact's pending and future reminders and feedback notifications. The delivery
+worker uses the verified WhatsApp sender ID and the same retry/status records as
+Telegram; patient-facing webhook queries are restricted to an explicit table and
+RPC allowlist. Emergency symptoms receive immediate-care guidance, matching the
+Telegram flow.
 
 To enable the Meta Cloud API adapter, configure all of these server-side values:
 
@@ -83,10 +91,25 @@ To enable the Meta Cloud API adapter, configure all of these server-side values:
 | `WHATSAPP_ACCESS_TOKEN` | Server-only Cloud API access token |
 | `WHATSAPP_PHONE_NUMBER_ID` | Cloud API sender phone-number ID |
 | `WHATSAPP_GRAPH_API_VERSION` | Graph API version used for outbound messages |
+| `WHATSAPP_NOTIFICATION_TEMPLATE` | Approved Meta template name for scheduled notifications |
+| `WHATSAPP_TEMPLATE_LANGUAGE` | Approved template language code (default `en`) |
+
+Create and get approval for a utility template whose body contains one text
+placeholder (for example, `Marina Smile update: {{1}}`); set its exact name and
+language above. Scheduled reminders and feedback use this template so they can
+be delivered outside WhatsApp's 24-hour customer-service window. Immediate
+booking replies remain ordinary text inside the patient-initiated conversation.
 
 Subscribe the HTTPS callback `https://<backend-host>/webhooks/whatsapp` to the
-WhatsApp `messages` field. No database migration is required because the durable
-workflow columns already exist.
+WhatsApp `messages` field. The workflow uses the existing conversation state
+columns; the notification preference and channel-aware delivery need the
+additive migration below.
+
+Apply `20261126010000_whatsapp_patient_notifications.sql` before enabling
+WhatsApp. It adds the contact notification preference and updates the scheduling
+and notification-claim functions. Scheduled WhatsApp delivery also requires the
+WhatsApp environment settings above; Telegram remains available for contacts
+whose preferred channel is Telegram.
 
 ## Telegram patient workflows
 

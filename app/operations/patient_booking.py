@@ -511,6 +511,7 @@ def finalize_booking_request(
     *,
     client: Client | None = None,
     calendar_client: Any | None = None,
+    notification_channel: str = "telegram",
 ) -> dict:
     """Reserve and confirm an approved or cash booking, creating its reminder."""
     supabase = client or get_supabase_client()
@@ -737,6 +738,7 @@ def finalize_booking_request(
         booking_request_id=request["id"],
         appointment_id=appointment["id"],
         notification_type="booking_confirmation",
+        channel=notification_channel,
         template_data=template,
         event_key=f"booking_confirmation:{appointment['id']}",
     )

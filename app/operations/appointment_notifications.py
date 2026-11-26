@@ -30,18 +30,21 @@ def record_immediate_notification(
     clinic_id: str,
     contact_id: str | None,
     notification_type: str,
+    channel: str = "telegram",
     booking_request_id: str | None = None,
     appointment_id: str | None = None,
     template_data: dict | None = None,
     event_key: str | None = None,
 ) -> None:
-    """Record an immediately delivered Telegram confirmation.
+    """Record an immediately delivered channel confirmation.
 
     The bot sends the user-facing message synchronously; this row is the
     durable delivery record and prevents duplicate sends by the worker.
     """
     if not contact_id:
         return
+    if channel not in {"telegram", "whatsapp"}:
+        raise ValueError("Unsupported notification channel")
     supabase = client or get_supabase_client()
     now = _now().isoformat()
     _insert(
@@ -52,7 +55,7 @@ def record_immediate_notification(
             "booking_request_id": booking_request_id,
             "appointment_id": appointment_id,
             "notification_type": notification_type,
-            "channel": "telegram",
+            "channel": channel,
             "scheduled_at": now,
             "sent_at": now,
             "status": "sent",

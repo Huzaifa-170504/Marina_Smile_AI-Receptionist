@@ -101,6 +101,8 @@ class Settings(BaseSettings):
     whatsapp_access_token: SecretStr | None = Field(default=None, alias="WHATSAPP_ACCESS_TOKEN")
     whatsapp_phone_number_id: str | None = Field(default=None, alias="WHATSAPP_PHONE_NUMBER_ID")
     whatsapp_graph_api_version: str | None = Field(default=None, alias="WHATSAPP_GRAPH_API_VERSION")
+    whatsapp_notification_template: str | None = Field(default=None, alias="WHATSAPP_NOTIFICATION_TEMPLATE")
+    whatsapp_template_language: str = Field(default="en", alias="WHATSAPP_TEMPLATE_LANGUAGE")
 
     @field_validator(
         "supabase_secret_key",
@@ -133,6 +135,7 @@ class Settings(BaseSettings):
         "whatsapp_access_token",
         "whatsapp_phone_number_id",
         "whatsapp_graph_api_version",
+        "whatsapp_notification_template",
         mode="before",
     )
     @classmethod
@@ -162,6 +165,10 @@ class Settings(BaseSettings):
             r"v\d+\.\d+", self.whatsapp_graph_api_version
         ):
             raise ValueError("WHATSAPP_GRAPH_API_VERSION must look like vXX.X")
+        if self.whatsapp_notification_template and not re.fullmatch(
+            r"[a-z0-9_]{1,512}", self.whatsapp_notification_template
+        ):
+            raise ValueError("WHATSAPP_NOTIFICATION_TEMPLATE must be a valid Meta template name")
         return self
 
     @property

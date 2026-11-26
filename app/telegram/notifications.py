@@ -9,8 +9,8 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from telegram import Bot
-from telegram.error import TelegramError
 
+from app.core.config import get_settings
 from app.database.supabase import get_supabase_client
 from app.telegram.ui import cancel_keyboard
 
@@ -82,12 +82,12 @@ def _single_row(data: Any) -> dict | None:
 # NOTIFICATION DATABASE OPERATIONS
 # ---------------------------------------------------------------------
 
-def _claim_notification() -> dict | None:
+def _claim_notification(channels: list[str] | None = None) -> dict | None:
     client = get_supabase_client()
-
+    params = {"p_channels": channels} if channels else {}
     result = client.rpc(
         "claim_outbound_notification",
-        {},
+        params,
     ).execute()
 
     notification = _single_row(result.data)
@@ -233,7 +233,7 @@ def _load_contact(
     query = (
         client.table("contacts")
         .select(
-            "id,telegram_chat_id,name,phone_number,email"
+            "id,telegram_chat_id,whatsapp_id,preferred_notification_channel,name,phone_number,email"
         )
         .eq("id", str(UUID(contact_id)))
     )
@@ -374,6 +374,7 @@ def _time_until(
 def _format_notification(
     notification: dict,
     appointment: dict | None,
+    channel: str = "telegram",
 ) -> str | None:
     notification_type = notification.get(
         "notification_type"
@@ -466,26 +467,33 @@ def _format_notification(
     )
 
     if notification_type == "appointment_reminder":
+        action_text = (
+            "Contact reception if you need to reschedule or cancel."
+            if channel == "whatsapp"
+            else "Open My Appointments for full details, or to reschedule or cancel."
+        )
         return (
             f"⏰ Reminder: your appointment is {time_until}.\n\n"
             f"{greeting}Reference: {reference}\n"
             f"When: {when}\n"
             f"Doctor: {doctor}\n"
             f"Payment: {payment}\n\n"
-            "Open My Appointments for full details, "
-            "or to reschedule or cancel."
+            f"{action_text}"
         )
 
     if notification_type == "final_reminder":
+        action_text = (
+            "Contact reception if you need to reschedule or cancel."
+            if channel == "whatsapp"
+            else "Open My Appointments for full details, or to reschedule or cancel."
+        )
         return (
             f"⏰ Final reminder: your appointment is {time_until}.\n\n"
             f"{greeting}Reference: {reference}\n"
             f"When: {when}\n"
             f"Doctor: {doctor}\n"
             f"Payment: {payment}\n\n"
-            "Please arrive a few minutes early. "
-            "Open My Appointments for full details, "
-            "or to reschedule or cancel."
+            f"Please arrive a few minutes early. {action_text}"
         )
 
     if notification_type == "feedback_request":
@@ -536,7 +544,7 @@ def _format_notification(
 # ---------------------------------------------------------------------
 
 async def _deliver(
-    bot: Bot,
+    bot: Bot | None,
     notification: dict,
 ) -> None:
     notification_id = _notification_id(notification)
@@ -551,6 +559,7 @@ async def _deliver(
     notification_type = notification.get(
         "notification_type"
     )
+    channel = notification.get("channel") or "telegram"
 
     try:
         attempt_count = int(
@@ -610,6 +619,7 @@ async def _deliver(
         text = _format_notification(
             notification,
             appointment,
+            channel=channel,
         )
 
         if not text:
@@ -636,33 +646,46 @@ async def _deliver(
             notification.get("clinic_id"),
         )
 
-        chat_id = (
-            contact.get("telegram_chat_id")
-            if contact
-            else None
-        )
+        if channel == "whatsapp":
+            recipient = (contact or {}).get("whatsapp_id")
+            if not recipient or not str(recipient).isdecimal():
+                await asyncio.to_thread(
+                    _complete_notification,
+                    notification_id,
+                    error="Contact has no verified WhatsApp recipient",
+                )
+                return
+            from app.whatsapp.client import send_notification
 
-        if not chat_id:
+            await send_notification(str(recipient), text)
+        elif channel == "telegram":
+            chat_id = (contact or {}).get("telegram_chat_id")
+            if not chat_id:
+                await asyncio.to_thread(
+                    _complete_notification,
+                    notification_id,
+                    error="Contact has no Telegram chat ID",
+                )
+                return
+            if bot is None:
+                raise RuntimeError("Telegram delivery is not configured on this worker")
+            await bot.send_message(
+                chat_id=int(chat_id),
+                text=text,
+                reply_markup=cancel_keyboard(),
+            )
+        else:
             await asyncio.to_thread(
                 _complete_notification,
                 notification_id,
-                error="Contact has no Telegram chat ID",
+                error=f"Unsupported notification channel: {channel}",
             )
             return
-
-        await bot.send_message(
-            chat_id=int(chat_id),
-            text=text,
-            reply_markup=cancel_keyboard(),
-        )
 
         # Telegram accepted the message.
         message_sent = True
 
-        logger.info(
-            "Telegram notification delivered successfully: %s",
-            notification_id,
-        )
+        logger.info("Patient notification delivered via %s: %s", channel, notification_id)
 
         # Update database separately from Telegram delivery.
         try:
@@ -672,28 +695,13 @@ async def _deliver(
             )
 
         except Exception:
-            # Do not retry Telegram delivery after a successful send.
+            # Do not retry after a successful provider send.
             # Doing so could send duplicate messages.
             logger.exception(
-                "Telegram message was sent, but database completion "
+                "Patient message was sent, but database completion "
                 "failed for notification %s. Manual reconciliation "
                 "may be required.",
                 notification_id,
-            )
-
-    except TelegramError as exc:
-        logger.warning(
-            "Telegram notification delivery failed for %s: %s",
-            notification_id,
-            exc,
-        )
-
-        if not message_sent:
-            await asyncio.to_thread(
-                _retry_notification,
-                notification_id,
-                str(exc),
-                attempt_count + 1,
             )
 
     except Exception as exc:
@@ -722,8 +730,25 @@ async def _deliver(
 # BACKGROUND NOTIFICATION WORKER
 # ---------------------------------------------------------------------
 
-async def run_notification_worker(bot: Bot) -> None:
-    """Deliver due notifications and reconcile served appointments."""
+async def run_notification_worker(bot: Bot | None = None) -> None:
+    """Deliver due channel notifications and reconcile served appointments."""
+
+    settings = get_settings()
+    if settings.whatsapp_access_token and not settings.whatsapp_notification_template:
+        logger.warning("WhatsApp scheduled notifications require WHATSAPP_NOTIFICATION_TEMPLATE")
+    if bot is None:
+        channels = (
+            ["whatsapp"]
+            if settings.whatsapp_access_token and settings.whatsapp_notification_template
+            else []
+        )
+    else:
+        channels = ["telegram"]
+        if settings.whatsapp_access_token and settings.whatsapp_notification_template:
+            channels.append("whatsapp")
+    if not channels:
+        logger.warning("Notification worker has no configured delivery channel")
+        return
 
     served_seconds = 0
 
@@ -744,7 +769,8 @@ async def run_notification_worker(bot: Bot) -> None:
 
             while True:
                 notification = await asyncio.to_thread(
-                    _claim_notification
+                    _claim_notification,
+                    channels,
                 )
 
                 if notification is None:

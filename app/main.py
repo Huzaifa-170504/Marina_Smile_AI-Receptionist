@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     telegram_application = None
+    notification_task = None
     holiday_sync_task = None
     app_settings = get_settings()
     if app_settings.holiday_sync_enabled:
@@ -40,6 +41,18 @@ async def lifespan(_app: FastAPI):
     else:
         logger.info("TELEGRAM_BOT_TOKEN is unset; starting API without Telegram polling")
 
+    if (
+        telegram_application is None
+        and app_settings.whatsapp_access_token is not None
+        and app_settings.whatsapp_notification_template
+    ):
+        from app.telegram.notifications import run_notification_worker
+
+        notification_task = asyncio.create_task(run_notification_worker())
+        logger.info("WhatsApp-only patient notification worker started")
+    elif telegram_application is None and app_settings.whatsapp_access_token is not None:
+        logger.warning("WhatsApp scheduled notifications require WHATSAPP_NOTIFICATION_TEMPLATE")
+
     try:
         yield
     finally:
@@ -47,6 +60,10 @@ async def lifespan(_app: FastAPI):
             holiday_sync_task.cancel()
             with suppress(asyncio.CancelledError):
                 await holiday_sync_task
+        if notification_task is not None:
+            notification_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await notification_task
         if telegram_application is not None:
             await stop_polling_bot(telegram_application)
 

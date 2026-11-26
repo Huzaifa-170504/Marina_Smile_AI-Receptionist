@@ -7,7 +7,6 @@ import logging
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-import httpx
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, Response
 from postgrest.exceptions import APIError
 
@@ -17,16 +16,28 @@ from app.operations.clinic_hours import clinic_date_error, get_clinic_holidays
 from app.operations.patient_booking import (
     BookingSlotTakenError, PatientBookingError, create_booking_request,
     finalize_booking_request, lookup_identities, normalize_phone,
-    resolve_or_register_patient,
+    phone_matches, resolve_or_register_patient,
 )
 from app.operations.patient_channel import WELCOME_MESSAGE
 from app.operations.slot_finder import find_available_slots
 from app.repositories.clinics import get_active_clinic
 from app.repositories.dentists import filter_dentists_for_service, list_active_dentists
+from app.whatsapp.client import send_text
+from app.whatsapp.privacy import WhatsAppSafeSupabase
 
 router = APIRouter(prefix="/webhooks/whatsapp", tags=["whatsapp"])
 logger = logging.getLogger(__name__)
 MENU = "Reply *Book appointment* to book, or *Menu* to see this message again."
+EMERGENCY_TERMS = (
+    "difficulty breathing", "can't breathe", "cannot breathe",
+    "difficulty swallowing", "can't swallow", "cannot swallow",
+    "severe facial swelling", "uncontrolled bleeding", "bleeding won't stop",
+)
+EMERGENCY_REPLY = (
+    "This may be a medical emergency. Difficulty breathing or swallowing, severe facial "
+    "swelling, or uncontrolled bleeding needs immediate professional care. Please call "
+    "your local emergency number or go to the nearest emergency department now."
+)
 
 
 def _settings():
@@ -75,7 +86,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks) -
                     sender = message.get("from", "")
                     text = (message.get("text") or {}).get("body", "").strip()
                     external_id = message.get("id", "")
-                    if sender and text and external_id:
+                    if sender.isdecimal() and 7 <= len(sender) <= 15 and text and external_id:
                         background_tasks.add_task(_process_safely, sender, external_id, text)
     return {"status": "ok"}
 
@@ -88,20 +99,11 @@ async def _process_safely(sender: str, message_id: str, text: str) -> None:
 
 
 async def _send(sender: str, text: str) -> None:
-    settings = _settings()
-    url = (f"https://graph.facebook.com/{settings.whatsapp_graph_api_version}/"
-           f"{settings.whatsapp_phone_number_id}/messages")
-    async with httpx.AsyncClient(timeout=10) as client:
-        response = await client.post(url, headers={
-            "Authorization": f"Bearer {settings.whatsapp_access_token.get_secret_value()}"
-        }, json={"messaging_product": "whatsapp", "recipient_type": "individual",
-                "to": sender, "type": "text",
-                "text": {"preview_url": False, "body": text}})
-        response.raise_for_status()
+    await send_text(sender, text)
 
 
 def _db():
-    return get_supabase_client()
+    return WhatsAppSafeSupabase(get_supabase_client())
 
 
 def _clinic_id() -> str:
@@ -114,20 +116,33 @@ def _get_conversation(sender: str) -> tuple[dict, dict]:
         "clinic_id", clinic).eq("whatsapp_id", sender).execute().data or []
     contact = contacts[0] if contacts else None
     if not contact:
+        matches = [row for row in db.table("contacts").select(
+            "id,phone_number,whatsapp_id").eq("clinic_id", clinic).not_.is_(
+            "phone_number", "null").execute().data or []
+            if phone_matches(row.get("phone_number"), sender)]
+        if len(matches) > 1:
+            raise RuntimeError("WhatsApp sender matches multiple patient contacts")
+        contact = matches[0] if matches else None
+    if not contact:
         try:
             contact = (db.table("contacts").insert({"clinic_id": clinic,
-                "whatsapp_id": sender, "phone_number": sender,
+                "whatsapp_id": sender, "phone_number": normalize_phone(sender),
                 "name": "WhatsApp patient"}).execute().data or [None])[0]
         except APIError as exc:
             if exc.code != "23505":
                 raise
-            existing = db.table("contacts").select("id,phone_number,whatsapp_id").eq(
-                "clinic_id", clinic).eq("phone_number", normalize_phone(sender)).limit(1).execute().data or []
-            contact = existing[0] if existing else db.table("contacts").select(
-                "id,phone_number,whatsapp_id").eq("clinic_id", clinic).eq(
-                "whatsapp_id", sender).single().execute().data
+            # A concurrent Telegram/WhatsApp registration won the normalized
+            # phone uniqueness race. Re-resolve by the verified phone number.
+            matches = [row for row in db.table("contacts").select(
+                "id,phone_number,whatsapp_id").eq("clinic_id", clinic).execute().data or []
+                if phone_matches(row.get("phone_number"), sender)]
+            if len(matches) != 1:
+                raise RuntimeError("WhatsApp contact could not be uniquely resolved") from exc
+            contact = matches[0]
     if not contact:
         raise RuntimeError("WhatsApp contact could not be resolved")
+    db.table("contacts").update({"whatsapp_id": sender}).eq(
+        "clinic_id", clinic).eq("id", contact["id"]).execute()
     rows = db.table("conversations").select(
         "id,contact_id,workflow_mode,workflow_step,workflow_state").eq(
         "clinic_id", clinic).eq("contact_id", contact["id"]).eq(
@@ -172,6 +187,8 @@ async def _process(sender: str, message_id: str, text: str) -> None:
     if normalized in {"menu", "home", "cancel", "stop"}:
         _state(conversation, None, {})
         await _reply(sender, contact, conversation, WELCOME_MESSAGE + "\n\n" + MENU)
+    elif any(term in normalized for term in EMERGENCY_TERMS):
+        await _reply(sender, contact, conversation, EMERGENCY_REPLY)
     elif not step and normalized in {"book", "booking", "book appointment", "appointment"}:
         await _begin(sender, contact, conversation)
     elif not step:
@@ -181,7 +198,22 @@ async def _process(sender: str, message_id: str, text: str) -> None:
 
 
 async def _begin(sender: str, contact: dict, conversation: dict) -> None:
-    info = await _run(lookup_identities, _clinic_id(), "phone", normalize_phone(sender))
+    _db().table("contacts").update({
+        "preferred_notification_channel": "whatsapp",
+    }).eq("clinic_id", _clinic_id()).eq("id", contact["id"]).execute()
+    _db().table("outbound_notifications").update({"channel": "whatsapp"}).eq(
+        "clinic_id", _clinic_id()).eq("contact_id", contact["id"]).eq(
+        "status", "pending").execute()
+    try:
+        info = await _run(lookup_identities, _clinic_id(), "phone", normalize_phone(sender), client=_db())
+    except PatientBookingError as exc:
+        _state(conversation, None, {})
+        await _reply(sender, contact, conversation, str(exc))
+        return
+    except Exception:
+        logger.exception("WhatsApp patient identity lookup failed")
+        await _reply(sender, contact, conversation, "I couldn't safely verify this number right now. Please try again later or contact reception.")
+        return
     own_ids = {c["id"] for c in info.get("contacts", []) if c["id"] == contact["id"]}
     patients = [p for p in info.get("patients", []) if p.get("active", True)
                 and p.get("primary_contact_id") in own_ids]
@@ -245,7 +277,7 @@ async def _advance(sender: str, contact: dict, conv: dict, step: str, state: dic
             await _reply(sender, contact, conv, "Reply with one or more service numbers, separated by commas.")
             return
         state["selected"] = [state["services"][i]["id"] for i in indexes]
-        docs = await _run(_eligible, _clinic_id(), state["selected"])
+        docs = await _run(_eligible, _clinic_id(), state["selected"], client=_db())
         if not docs:
             await _reply(sender, contact, conv, "No single doctor provides all those services. Choose fewer services or send Menu.")
             return
@@ -259,7 +291,7 @@ async def _advance(sender: str, contact: dict, conv: dict, step: str, state: dic
             return
         state["doctor"] = state["doctors"][i]
         _state(conv, "date", state)
-        clinic = await _run(get_active_clinic, _clinic_id())
+        clinic = await _run(get_active_clinic, _clinic_id(), client=_db())
         today = datetime.now(ZoneInfo(clinic.timezone)).date()
         await _reply(sender, contact, conv, f"Send your preferred date as YYYY-MM-DD, from today through {(today + timedelta(days=30)).isoformat()}. Weekends and public holidays are closed.")
     elif step == "date":
@@ -268,11 +300,11 @@ async def _advance(sender: str, contact: dict, conv: dict, step: str, state: dic
         except ValueError:
             await _reply(sender, contact, conv, "Send the date as YYYY-MM-DD, for example 2026-11-27.")
             return
-        clinic = await _run(get_active_clinic, _clinic_id())
+        clinic = await _run(get_active_clinic, _clinic_id(), client=_db())
         tz = ZoneInfo(clinic.timezone)
         today = datetime.now(tz).date()
         last = today + timedelta(days=30)
-        holidays = set(await _run(get_clinic_holidays, _clinic_id(), today, last))
+        holidays = set(await _run(get_clinic_holidays, _clinic_id(), today, last, client=_db()))
         error = clinic_date_error(clinic, chosen, holidays)
         if chosen < today or chosen > last or error:
             await _reply(sender, contact, conv, error or "Choose a date from today through the next 30 days.")
@@ -284,7 +316,7 @@ async def _advance(sender: str, contact: dict, conv: dict, step: str, state: dic
             start = max(start, datetime.now(tz) + timedelta(hours=1))
         found = await _run(find_available_slots, _clinic_id(), state["doctor"]["id"],
             state["selected"][0], start, day_end, 10,
-            duration_override_minutes=duration)
+            duration_override_minutes=duration, client=_db())
         if not found.slots:
             await _reply(sender, contact, conv, "No live appointment times are available on that date. Send another weekday date.")
             return
@@ -302,7 +334,7 @@ async def _advance(sender: str, contact: dict, conv: dict, step: str, state: dic
         services = [s for s in state["services"] if s["id"] in state["selected"]]
         total = sum(float(s.get("price_from") or 0) for s in services)
         state["total"] = total
-        clinic = await _run(get_active_clinic, _clinic_id())
+        clinic = await _run(get_active_clinic, _clinic_id(), client=_db())
         when = datetime.fromisoformat(state["slot"]["start_at"]).astimezone(ZoneInfo(clinic.timezone)).strftime("%a %d %b %Y, %I:%M %p")
         _state(conv, "confirm", state)
         patient = state.get("patient") or state.get("profile", {})
@@ -334,10 +366,10 @@ async def _services(sender: str, contact: dict, conv: dict, state: dict) -> None
     await _reply(sender, contact, conv, "Choose one or more services by number, separated by commas:\n" + "\n".join(lines))
 
 
-def _eligible(clinic_id: str, service_ids: list[str]):
-    dentists = list_active_dentists(clinic_id)
+def _eligible(clinic_id: str, service_ids: list[str], *, client=None):
+    dentists = list_active_dentists(clinic_id, client=client)
     for service_id in service_ids:
-        allowed = {d.id for d in filter_dentists_for_service(clinic_id, dentists, service_id)}
+        allowed = {d.id for d in filter_dentists_for_service(clinic_id, dentists, service_id, client=client)}
         dentists = [d for d in dentists if d.id in allowed]
     return dentists
 
@@ -349,7 +381,7 @@ async def _confirm(sender: str, contact: dict, conv: dict, state: dict) -> None:
             profile = state["profile"]
             patient = await _run(resolve_or_register_patient, _clinic_id(), "phone",
                 state["phone"], profile["name"], age_at_registration=profile["age"],
-                gender=profile["gender"])
+                gender=profile["gender"], client=_db())
         start = datetime.fromisoformat(state["slot"]["start_at"])
         cursor, service_lines = start, []
         for row in state["services"]:
@@ -363,8 +395,9 @@ async def _confirm(sender: str, contact: dict, conv: dict, state: dict) -> None:
             cursor = end
         request_row = await _run(create_booking_request, clinic_id=_clinic_id(), patient=patient,
             services=service_lines, dentist_id=state["doctor"]["id"], start_at=start,
-            end_at=cursor, payment_mode="cash")
-        result = await _run(finalize_booking_request, _clinic_id(), request_row["id"])
+            end_at=cursor, payment_mode="cash", client=_db())
+        result = await _run(finalize_booking_request, _clinic_id(), request_row["id"],
+            client=_db(), notification_channel="whatsapp")
         if result.get("status") != "confirmed":
             await _run(_cancel_booking_request, request_row["id"])
             raise PatientBookingError("The appointment could not be confirmed. Please choose another available time.")
